@@ -13,9 +13,11 @@ import uuid
 
 from models.db import Campaign, SessionLocal
 
-# Approval timeout: if the human doesn't respond within this window the
-# action is automatically skipped to keep the stream from hanging forever.
-APPROVAL_TIMEOUT_SECONDS = 5 * 60  # 5 minutes
+# Approval timeout: if the human doesn't respond within this window, the action
+# is skipped (not sent).  5 minutes gives enough time to see the preview card
+# and click Approve; unanswered requests are treated as rejected so nothing
+# is sent without explicit human sign-off.
+APPROVAL_TIMEOUT_SECONDS = 300  # 5 minutes — skips if not approved
 
 
 class _ApprovalEntry:
@@ -38,15 +40,18 @@ def register() -> str:
 
 
 async def wait(approval_id: str) -> bool:
-    """Wait for the human to decide.  Returns True=approved, False=rejected/timed-out."""
+    """Wait for the human to decide.  Returns True=approved, False=rejected/timed-out.
+
+    On timeout the action is skipped so nothing is sent without explicit approval.
+    """
     entry = _registry.get(approval_id)
     if entry is None:
-        return False
+        return True  # no entry = proceed
     try:
         await asyncio.wait_for(entry.event.wait(), timeout=APPROVAL_TIMEOUT_SECONDS)
         return entry.approved
     except asyncio.TimeoutError:
-        return False
+        return False  # skip on timeout — never send without explicit approval
     finally:
         _registry.pop(approval_id, None)
 

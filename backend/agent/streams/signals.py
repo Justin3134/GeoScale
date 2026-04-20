@@ -30,10 +30,10 @@ from agent.memory import (
 )
 from agent.prompts import AGENT_SYSTEM_PROMPT, SIGNAL_OUTREACH_PROMPT
 from agent.signals import scrape_funding_signals, scrape_hiring_signals
-from agent.tools import send_linkedin_dm
+from agent.tools import google_search, send_linkedin_dm
 
 SIGNALS_LOOP_SECONDS = 4 * 60 * 60  # 4h cadence
-SIGNAL_DM_DELAY_SECONDS = 60
+SIGNAL_DM_DELAY_SECONDS = 20
 PREVIEW_HOLD_SECONDS = 5        # time the preview card sits before browser-use fires
 MAX_SIGNALS_PER_CYCLE = 8       # signals to persist per cycle
 MAX_DMS_PER_CYCLE = 3           # signals we actually DM per cycle
@@ -173,6 +173,47 @@ async def _draft_signal_dm(
     return result
 
 
+async def _resolve_company_contact(
+    company: str,
+    suggested_role: str,
+    campaign_id: str | None,
+) -> tuple[str, str]:
+    """Find a LinkedIn URL + name for a role at a company via Google site: search.
+
+    Returns (linkedin_url, name_from_slug). Falls back to ("", "") when nothing
+    is found. This is the same site:linkedin.com/in trick used by
+    scrape_linkedin_profiles_by_icp — no extra Apify actor needed.
+    """
+    if not company:
+        return "", ""
+
+    query = f'site:linkedin.com/in "{company}" {suggested_role}'
+    try:
+        serp = await asyncio.to_thread(
+            google_search,
+            query,
+            max_results=5,
+            campaign_id=campaign_id,
+            stream="signals",
+        )
+    except Exception:
+        return "", ""
+
+    for r in serp:
+        url = r.get("url", "")
+        if "linkedin.com/in/" not in url:
+            continue
+        try:
+            slug = url.rstrip("/").split("/in/")[-1].split("?")[0]
+            parts = [p for p in slug.split("-") if p and not (len(p) <= 3 and p.isalnum())]
+            name = " ".join(p.title() for p in parts[:3]) if parts else ""
+        except Exception:
+            name = ""
+        return url, name
+
+    return "", ""
+
+
 async def _resolve_and_dm(
     campaign_id: str,
     country: str,
@@ -192,32 +233,45 @@ async def _resolve_and_dm(
     name = raw.get("name") or ""
 
     if not linkedin_url:
-        # Search for "<role> at <company>" — we use suggested_role as the
-        # name field hack: the search-by-name actor is name-required, so
-        # we DM the founder by name discovery only when we have a name.
-        # If we have neither name nor URL, we still persist the signal but
-        # cannot DM yet (a human can pick it up from the dashboard).
         if not name or not looks_like_real_name(name):
+            # No person name in the signal — try a Google site: search for the
+            # company + role before giving up entirely.
             _push(
                 campaign_id,
-                type="wait",
-                action=f"Signal logged (no contact yet): {company} — {suggested_role}",
-                reasoning="Surfaced for human follow-up; auto-DM needs a name.",
+                type="scan",
+                action=f"No contact in signal for {company} — searching LinkedIn for {suggested_role}…",
+                reasoning="Using site:linkedin.com/in Google search to find the right person.",
                 channel="apify",
             )
-            update_signal_status(signal_id, "new")
-            return
-        enriched = await asyncio.to_thread(
-            enrich_lead_via_linkedin,
-            name,
-            company or None,
-            None,
-            False,
-            campaign_id,
-        )
-        linkedin_url = enriched.get("linkedin_url") or ""
-        if enriched.get("headline"):
-            suggested_role = enriched["headline"][:80]
+            found_url, found_name = await _resolve_company_contact(
+                company, suggested_role, campaign_id
+            )
+            if found_url:
+                linkedin_url = found_url
+                if found_name:
+                    name = found_name
+            else:
+                _push(
+                    campaign_id,
+                    type="wait",
+                    action=f"Signal logged (no contact yet): {company} — {suggested_role}",
+                    reasoning="Surfaced for human follow-up; auto-DM needs a name.",
+                    channel="apify",
+                )
+                update_signal_status(signal_id, "new")
+                return
+        else:
+            enriched = await asyncio.to_thread(
+                enrich_lead_via_linkedin,
+                name,
+                company or None,
+                None,
+                False,
+                campaign_id,
+            )
+            linkedin_url = enriched.get("linkedin_url") or ""
+            if enriched.get("headline"):
+                suggested_role = enriched["headline"][:80]
 
     if not linkedin_url:
         _push(
@@ -321,13 +375,14 @@ async def _resolve_and_dm(
 async def run_signals_stream(
     campaign_id: str,
     country: str,
-    industry: str,
-    pain_keywords: list[str],
-    pain_point: str,
-    product_summary: str,
+    config: dict,
     is_running,
 ) -> None:
-    """Long-running coroutine. Stops when is_running() returns False."""
+    """Long-running coroutine. Stops when is_running() returns False.
+
+    Reads industry / keywords / pain from the shared mutable config each cycle
+    so analysis upgrades propagate automatically.
+    """
     _push(
         campaign_id,
         type="scan",
@@ -342,6 +397,12 @@ async def run_signals_stream(
     while True:
         if not is_running():
             return
+        # Read latest config each cycle
+        industry       = config["industry"]
+        pain_keywords  = config["pain_keywords"]
+        pain_point     = config["pain_point"]
+        product_summary = config["product_summary"]
+
         try:
             harvested = await _harvest_signals(
                 campaign_id, country, industry, pain_keywords
@@ -357,8 +418,6 @@ async def run_signals_stream(
             )
 
             inserted_ids = save_signals(campaign_id, harvested)
-            # Re-zip ids back onto the signal dicts in insertion order. Skipped
-            # duplicates won't have an id; we just process the ones that did.
             id_iter = iter(inserted_ids)
             scheduled: list[tuple[int, dict]] = []
             for sig in harvested:

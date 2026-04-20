@@ -51,9 +51,6 @@ export default function LeadDetailCard({ lead }: { lead: Lead }) {
             </p>
           )}
         </div>
-        <div className="text-[12px] font-mono text-neutral-400 tabular-nums shrink-0">
-          {lead.score}/10
-        </div>
       </div>
 
       <div className="flex flex-wrap gap-3 mb-3">

@@ -11,10 +11,13 @@ Cost discipline:
   • in-process LRU cache by (name_lower, company_lower) so the same lead isn't
     re-billed on every campaign cycle
   • optional email lookup ($10/1k) is opt-in via `with_email=True`
+  • Tavily web search is used as a last-resort fallback when Apify returns
+    nothing — it costs ~1 credit and yields a lower-confidence match
 """
 
 from __future__ import annotations
 
+import re
 import threading
 from typing import Any
 
@@ -98,6 +101,62 @@ def _company_to_linkedin_url(company: str) -> str:
     return f"https://www.linkedin.com/company/{slug.strip('-')}"
 
 
+# ─── Tavily fallback ──────────────────────────────────────────────────────
+
+_LI_PROFILE_RE = re.compile(
+    r"https?://(?:www\.)?linkedin\.com/in/([A-Za-z0-9\-_%]+)/?",
+    re.IGNORECASE,
+)
+
+
+def _tavily_linkedin_search(name: str, company: str | None) -> dict:
+    """
+    Last-resort fallback: use Tavily web search to find a LinkedIn profile URL
+    when Apify returns nothing.  Returns the same shape as the main function,
+    but with a lower match_score (~0.35) to signal reduced confidence.
+    """
+    try:
+        from tavily import TavilyClient  # lazy import — not required for other paths
+
+        query_parts = [f'"{name}"']
+        if company:
+            query_parts.append(f'"{company}"')
+        query_parts.append("site:linkedin.com/in")
+        query = " ".join(query_parts)
+
+        client = TavilyClient()
+        response = client.search(
+            query=query,
+            max_results=5,
+            search_depth="basic",
+            include_domains=["linkedin.com"],
+        )
+
+        results = response.get("results") or []
+        for r in results:
+            url = r.get("url") or ""
+            if _LI_PROFILE_RE.match(url):
+                title = r.get("title") or ""
+                snippet = r.get("content") or ""
+                score = 0.35
+                if name.lower() in (title + " " + snippet).lower():
+                    score += 0.1
+                if company and company.lower() in (title + " " + snippet).lower():
+                    score += 0.1
+                return {
+                    "linkedin_url": url.split("?")[0].rstrip("/"),
+                    "headline": title,
+                    "company": company or "",
+                    "location": "",
+                    "email": "",
+                    "match_score": round(score, 2),
+                    "source": "tavily",
+                }
+    except Exception:
+        pass
+    return {}
+
+
 # ─── Public API ───────────────────────────────────────────────────────────
 
 
@@ -150,7 +209,7 @@ def enrich_lead_via_linkedin(
         campaign_id=campaign_id,
         stream="signals",
         max_items=5,
-        timeout_secs=120,
+        timeout_secs=60,
     )
 
     best: dict | None = None
@@ -192,7 +251,11 @@ def enrich_lead_via_linkedin(
         if best is None or candidate["match_score"] > best["match_score"]:
             best = candidate
 
-    result = best or {}
+    if best:
+        result = best
+    else:
+        result = _tavily_linkedin_search(name, company_hint or "")
+
     _cache_put(name, company_hint or "", result)
     return result
 
@@ -203,9 +266,45 @@ def fetch_full_profile(
     campaign_id: str | None = None,
 ) -> dict:
     """Direct profile fetch — used when we already have a LinkedIn URL but
-    need richer detail (email, headline, current company)."""
+    need richer detail (email, headline, current company).
+
+    Primary: sourabhbgp/linkedin-profile-scraper ($2/1k, accepts URL or username).
+    Fallback: harvestapi/linkedin-profile-scraper ($4/1k) when primary returns nothing.
+    """
     if not profile_url:
         return {}
+
+    items = _apify_run(
+        "sourabhbgp/linkedin-profile-scraper",
+        {
+            "profiles": [profile_url],
+            "maxResults": 1,
+        },
+        campaign_id=campaign_id,
+        stream="signals",
+        max_items=1,
+        timeout_secs=120,
+    )
+
+    def _norm_sourabhbgp(p: dict) -> dict:
+        employer = p.get("employer") or {}
+        if isinstance(employer, dict):
+            company = employer.get("name") or ""
+        else:
+            company = str(employer)
+        return {
+            "linkedin_url": p.get("profileUrl") or profile_url,
+            "headline": p.get("jobTitle") or p.get("description") or "",
+            "company": company,
+            "location": p.get("location") or "",
+            "email": "",
+            "full_name": p.get("name") or p.get("username") or "",
+        }
+
+    if items:
+        return _norm_sourabhbgp(items[0])
+
+    # Fallback to HarvestAPI scraper
     items = _apify_run(
         "harvestapi/linkedin-profile-scraper",
         {
@@ -221,15 +320,27 @@ def fetch_full_profile(
         max_items=1,
         timeout_secs=120,
     )
+
     if not items:
         return {}
     p = items[0]
     return {
         "linkedin_url": profile_url,
-        "headline": p.get("headline") or p.get("position") or "",
-        "company": p.get("company") or p.get("currentCompany") or "",
-        "location": p.get("location") or "",
-        "email": p.get("email") or p.get("emailAddress") or "",
+        "headline": p.get("headline") or p.get("position") or p.get("title") or "",
+        "company": (
+            p.get("company")
+            or p.get("currentCompany")
+            or p.get("companyName")
+            or ""
+        ),
+        "location": p.get("location") or p.get("geo") or "",
+        "email": (
+            p.get("email")
+            or p.get("emailAddress")
+            or p.get("workEmail")
+            or p.get("personalEmail")
+            or ""
+        ),
         "full_name": p.get("fullName") or p.get("name") or "",
     }
 

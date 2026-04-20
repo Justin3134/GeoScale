@@ -4,7 +4,6 @@ import type {
   CompanySignal,
   Country,
   Lead,
-  Opportunity,
   Stats,
 } from './types'
 
@@ -46,16 +45,6 @@ export async function getLeads(campaignId: string): Promise<Lead[]> {
     cache: 'no-store',
   })
   if (!res.ok) throw new Error(`getLeads failed: ${res.status}`)
-  return res.json()
-}
-
-export async function getOpportunities(
-  campaignId: string,
-): Promise<Opportunity[]> {
-  const res = await fetch(`${BASE}/campaign/${campaignId}/opportunities`, {
-    cache: 'no-store',
-  })
-  if (!res.ok) throw new Error(`getOpportunities failed: ${res.status}`)
   return res.json()
 }
 
@@ -139,6 +128,18 @@ export async function rejectAction(
     { method: 'POST' },
   )
   if (!res.ok) throw new Error(`rejectAction failed: ${res.status}`)
+  return res.json()
+}
+
+export async function sendGmailLead(
+  campaignId: string,
+  leadId: number,
+): Promise<{ status: string }> {
+  const res = await fetch(
+    `${BASE}/campaign/${campaignId}/leads/${leadId}/send-gmail`,
+    { method: 'POST' },
+  )
+  if (!res.ok) throw new Error(`sendGmailLead failed: ${res.status}`)
   return res.json()
 }
 

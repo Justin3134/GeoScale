@@ -15,7 +15,7 @@ from agent.country import get_country_config, list_countries  # noqa: E402
 from agent import approval as _approval  # noqa: E402
 from agent.loop import active_streams, run_agent  # noqa: E402
 from agent.memory import get_signals  # noqa: E402
-from agent.tools import healthcheck_apify  # noqa: E402
+from agent.tools import healthcheck_apify, send_gmail  # noqa: E402
 from models.db import (  # noqa: E402
     AgentAction,
     Campaign,
@@ -166,7 +166,6 @@ async def stream_events(campaign_id: str):
 
 def _campaign_to_dict(c: Campaign, db) -> dict:
     leads = db.query(Lead).filter(Lead.campaign_id == c.id).all()
-    opps = db.query(Opportunity).filter(Opportunity.campaign_id == c.id).all()
     signals = db.query(CompanySignal).filter(CompanySignal.campaign_id == c.id).all()
     actions_count = (
         db.query(AgentAction).filter(AgentAction.campaign_id == c.id).count()
@@ -186,10 +185,6 @@ def _campaign_to_dict(c: Campaign, db) -> dict:
         ),
         "replied": len([l for l in leads if l.status in ("replied", "meeting")]),
         "meetings": len([l for l in leads if l.status == "meeting"]),
-        "total_opportunities": len(opps),
-        "opportunities_contacted": len(
-            [o for o in opps if o.status in ("contacted", "replied", "booked")]
-        ),
         "total_signals": len(signals),
         "signals_contacted": len(
             [s for s in signals if s.status == "contacted"]
@@ -232,6 +227,7 @@ def get_leads(campaign_id: str):
         )
         return [
             {
+                "id": l.id,
                 "name": l.name,
                 "title": l.title,
                 "company": l.company,
@@ -243,38 +239,9 @@ def get_leads(campaign_id: str):
                 "reply_text": l.reply_text,
                 "reply_language": l.reply_language,
                 "linkedin_url": l.linkedin_url,
+                "email": l.email,
             }
             for l in leads
-        ]
-    finally:
-        db.close()
-
-
-@app.get("/campaign/{campaign_id}/opportunities")
-def get_opportunities(campaign_id: str):
-    db = SessionLocal()
-    try:
-        opps = (
-            db.query(Opportunity)
-            .filter(Opportunity.campaign_id == campaign_id)
-            .order_by(Opportunity.score.desc(), Opportunity.id.desc())
-            .all()
-        )
-        return [
-            {
-                "id": o.id,
-                "type": o.type,
-                "title": o.title,
-                "description": o.description,
-                "url": o.url,
-                "contact_url": o.contact_url,
-                "contact_email": o.contact_email,
-                "score": o.score,
-                "status": o.status,
-                "pitch_text": o.pitch_text,
-                "pitch_language": o.pitch_language,
-            }
-            for o in opps
         ]
     finally:
         db.close()
@@ -326,7 +293,6 @@ def get_stats(campaign_id: str):
     db = SessionLocal()
     try:
         leads = db.query(Lead).filter(Lead.campaign_id == campaign_id).all()
-        opps = db.query(Opportunity).filter(Opportunity.campaign_id == campaign_id).all()
         signals = (
             db.query(CompanySignal)
             .filter(CompanySignal.campaign_id == campaign_id)
@@ -340,10 +306,6 @@ def get_stats(campaign_id: str):
             ),
             "replied": len([l for l in leads if l.status in ("replied", "meeting")]),
             "meetings": len([l for l in leads if l.status == "meeting"]),
-            "total_opportunities": len(opps),
-            "opportunities_contacted": len(
-                [o for o in opps if o.status in ("contacted", "replied", "booked")]
-            ),
             "total_signals": len(signals),
             "signals_contacted": len(
                 [s for s in signals if s.status == "contacted"]
@@ -422,7 +384,7 @@ def update_campaign_settings(campaign_id: str, req: CampaignSettingsRequest):
 
 
 @app.post("/campaign/{campaign_id}/approve/{approval_id}")
-def approve_action(campaign_id: str, approval_id: str):
+async def approve_action(campaign_id: str, approval_id: str):
     """Human approved a pending browser-use action."""
     found = _approval.resolve(approval_id, approved=True)
     if not found:
@@ -431,12 +393,72 @@ def approve_action(campaign_id: str, approval_id: str):
 
 
 @app.post("/campaign/{campaign_id}/reject/{approval_id}")
-def reject_action(campaign_id: str, approval_id: str):
+async def reject_action(campaign_id: str, approval_id: str):
     """Human rejected a pending browser-use action."""
     found = _approval.resolve(approval_id, approved=False)
     if not found:
         raise HTTPException(status_code=404, detail="Approval not found or already resolved")
     return {"status": "rejected"}
+
+
+async def _send_gmail_background(
+    campaign_id: str,
+    lead_id: int,
+    linkedin_url: str | None,
+    name: str,
+    reply_text: str,
+    to_email: str | None,
+) -> None:
+    """Run Browser-Use to open Gmail and send a cold-outreach email for a lead."""
+    if not to_email:
+        from agent.tools import _push_error
+        _push_error(
+            campaign_id,
+            "gmail",
+            f"Cannot send email for {name}: no email address on file.",
+            stream="people",
+        )
+        return
+
+    subject = f"Quick intro — {name}"
+    result = await send_gmail(to_email, subject, reply_text, campaign_id)
+
+    # Mark lead as contacted if Browser-Use succeeded
+    success = isinstance(result, dict) and "error" not in str(result.get("result", "")).lower()
+    if success:
+        db = SessionLocal()
+        try:
+            lead = db.query(Lead).filter(Lead.id == lead_id).first()
+            if lead:
+                lead.status = "contacted"
+                db.commit()
+        finally:
+            db.close()
+
+
+@app.post("/campaign/{campaign_id}/leads/{lead_id}/send-gmail")
+async def send_gmail_lead(campaign_id: str, lead_id: int):
+    """Trigger Browser-Use to send the drafted Gmail outreach for a specific lead."""
+    db = SessionLocal()
+    try:
+        lead = db.query(Lead).filter(
+            Lead.id == lead_id, Lead.campaign_id == campaign_id
+        ).first()
+        if not lead:
+            raise HTTPException(status_code=404, detail="Lead not found")
+        if not lead.reply_text:
+            raise HTTPException(status_code=400, detail="No draft message for this lead")
+        to_email = lead.email
+        linkedin_url = lead.linkedin_url
+        name = lead.name or "Contact"
+        reply_text = lead.reply_text
+    finally:
+        db.close()
+
+    asyncio.create_task(
+        _send_gmail_background(campaign_id, lead_id, linkedin_url, name, reply_text, to_email)
+    )
+    return {"status": "sending"}
 
 
 @app.get("/health")

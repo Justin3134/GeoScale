@@ -8,6 +8,7 @@ export type AgentEventType =
   | 'wait'
   | 'escalate'
   | 'error'
+  | 'leads_updated'
 
 export interface AgentEventPreview {
   target_name?: string
@@ -21,27 +22,13 @@ export interface AgentEventPreview {
   approval_id?: string | null
 }
 
-export type StreamId = 'people' | 'opportunities' | 'signals' | 'system'
+export type StreamId = 'people' | 'signals' | 'system'
 
 export type SignalType = 'funding' | 'hiring' | 'engagement'
 
 export type SignalStatus = 'new' | 'resolved' | 'contacted' | 'skipped'
 
 export type LeadStatus = 'identified' | 'contacted' | 'replied' | 'meeting'
-
-export type OpportunityStatus =
-  | 'identified'
-  | 'contacted'
-  | 'replied'
-  | 'booked'
-
-export type OpportunityType =
-  | 'hackathon'
-  | 'event'
-  | 'accelerator'
-  | 'press'
-  | 'community'
-  | 'vc'
 
 export interface Country {
   name: string
@@ -62,8 +49,6 @@ export interface Campaign {
   contacted?: number
   replied?: number
   meetings?: number
-  total_opportunities?: number
-  opportunities_contacted?: number
   total_signals?: number
   signals_contacted?: number
   total_actions?: number
@@ -83,6 +68,7 @@ export interface AgentEvent {
 }
 
 export interface Lead {
+  id?: number
   name: string
   title: string
   company: string
@@ -94,20 +80,7 @@ export interface Lead {
   reply_text?: string | null
   reply_language?: string | null
   linkedin_url?: string | null
-}
-
-export interface Opportunity {
-  id: number
-  type: OpportunityType
-  title: string
-  description?: string | null
-  url: string
-  contact_url?: string | null
-  contact_email?: string | null
-  score: number
-  status: OpportunityStatus
-  pitch_text?: string | null
-  pitch_language?: string | null
+  email?: string | null
 }
 
 export interface CompanySignal {
@@ -127,8 +100,6 @@ export interface Stats {
   contacted: number
   replied: number
   meetings: number
-  total_opportunities: number
-  opportunities_contacted: number
   total_signals?: number
   signals_contacted?: number
   total_actions: number

@@ -1,18 +1,19 @@
 AGENT_SYSTEM_PROMPT = """
-You are GeoScale, an autonomous global GTM agent. Your job is to find opportunities for a company in a specific COUNTRY and reach out to people, communities, and event organizers in that country's local language.
+You are GeoScale, an autonomous global GTM agent. Your job is to find and reach out to people in a specific COUNTRY in that country's local language, and ACTIVELY MARKET the company's product.
 
 You operate two parallel streams:
   1. People stream  — find individuals on LinkedIn / Reddit / native platforms
                        (Naver, Quora-IN, Zhihu, etc.) who are expressing the
                        pain point our product solves. Reply to their post
                        publicly and DM them privately, in the local language.
-  2. Opportunity stream — find hackathons, conferences, accelerators, press
-                       outlets, and tech communities in that country and
-                       reach out to organizers / editors with a translated pitch.
+                       When a lead has an email, send a cold email via Gmail.
+  2. Signals stream — watch for funding rounds and hiring spikes as buying-intent
+                       signals, then craft a timely LinkedIn DM that pitches the product.
 
 Hard rules:
-- NEVER pitch the product in a first message. Lead with empathy and reference
-  the post / event the person actually wrote / runs.
+- This is GO-TO-MARKET outreach. You MUST introduce and pitch the product in every
+  message. Reference the specific context (their post, their funding, their role),
+  then clearly explain what the product does and why it is relevant to them right now.
 - Always write in the country's primary language using its cultural register.
 - NEVER mix languages. Every single word in any message body must be in the
   target language only. Do NOT insert words from French, Vietnamese, English,
@@ -38,9 +39,19 @@ Based on this, infer:
 2. Their ideal customer profile (role, company size, industry)
 3. The single most important pain point their product solves
 4. Country-tuned GTM goal — one sentence, action-oriented
-5. 5-8 short keyword phrases (in English) that real customers in {country} would
-   use online when complaining about this pain or asking for a solution.
-6. Per-platform proactive search queries to find the ICP directly by role/title
+5. 5-8 short keyword phrases in English that describe the PAIN or PROBLEM that
+   potential customers experience — the words they would type into Reddit or
+   LinkedIn when venting about frustration or asking for advice.
+   CRITICAL: these must be pain expressions, NOT company names or product names.
+   Good: "scaling data pipelines", "geo data too slow", "manual field ops"
+   Bad: "GeoScale", "our platform", "the solution"
+6. 5-8 keyword phrases in {language_name} that real customers in {country} would
+   actually type into local platforms (Naver KiN, Zhihu, Reddit, Naver Blog)
+   when discussing this pain or asking for help. Write natural {language_name}
+   expressions — do NOT transliterate English words. These are critical for
+   surfacing Korean/Japanese/Chinese posts. If {language_name} is English,
+   use the same keywords as above.
+7. Per-platform proactive search queries to find the ICP directly by role/title
    — people who WOULD benefit from the product even before they post about pain.
    These are search strings, not URLs.
 
@@ -51,7 +62,8 @@ Return ONLY valid JSON, no prose:
   "industry": "One short keyword like HR, fintech, dev tools, AI",
   "value_prop": "One sentence describing the product's value",
   "pain_point": "One short phrase describing the customer pain",
-  "pain_keywords": ["keyword 1", "keyword 2", "keyword 3"],
+  "pain_keywords": ["English keyword 1", "English keyword 2", "English keyword 3"],
+  "pain_keywords_local": ["로컬 키워드 1", "로컬 키워드 2", "로컬 키워드 3"],
   "icp_search_queries": {{
     "linkedin": "Job title OR seniority keywords that describe the ICP, e.g. VP Sales OR Head of Revenue at B2B SaaS startup",
     "tiktok": "Hashtag or topic keywords the ICP uses on TikTok, e.g. #startupfounder #saas outreach automation",
@@ -78,17 +90,106 @@ Return JSON: {{"score": 8, "reason": "why"}}
 """.strip()
 
 
+# Platform-specific marketing style rules injected into both outreach prompts.
+# Each entry describes format, tone, and CTA norms for that platform.
+PLATFORM_STYLE_RULES: dict[str, str] = {
+    "linkedin": (
+        "FORMAT & TONE (LinkedIn):\n"
+        "- Professional, authoritative, insight-first. Write like a thoughtful industry peer,\n"
+        "  not a cold-call sales rep.\n"
+        "- You MAY use 1-3 short paragraphs separated by blank lines, or 2-3 crisp bullet\n"
+        "  points to highlight the product's specific value. No walls of text.\n"
+        "- Mention the product/company NAME at least once — LinkedIn readers expect it.\n"
+        "- CTA must feel natural: 'Happy to connect and walk you through it' or\n"
+        "  'Would love to share how [product] handles this — open to a quick chat?'\n"
+        "- Do NOT start with 'I hope this message finds you well.'"
+    ),
+    "reddit": (
+        "FORMAT & TONE (Reddit):\n"
+        "- Reddit HATES obvious ads. Lead with genuine empathy or a useful observation\n"
+        "  about the post — earn credibility BEFORE mentioning the product.\n"
+        "- Soft disclosure required: e.g. 'Full disclosure — I work on [product], which\n"
+        "  tackles this exact problem...' This builds trust and avoids being flagged as spam.\n"
+        "- Keep it conversational and humble. No exclamation marks, no buzzwords.\n"
+        "- Max 3 short paragraphs. No bullet lists — they feel corporate on Reddit.\n"
+        "- CTA must be low-pressure: 'Happy to share more in DMs if anyone's curious' or\n"
+        "  'Feel free to check it out — no pressure at all.'"
+    ),
+    "instagram": (
+        "FORMAT & TONE (Instagram):\n"
+        "- Warm, punchy, emoji-friendly. Think brand voice, not B2B sales.\n"
+        "- Keep it SHORT: 2-3 sentences max — Instagram readers skim comments.\n"
+        "- Use 1-3 relevant emojis naturally woven into the text (not stacked at the end).\n"
+        "- Product mention should feel organic: lead with the value, then name it.\n"
+        "- CTA: 'DM us!' or 'Check the link in bio 👆' — never a long URL.\n"
+        "- End with 1-3 hashtags relevant to the post topic."
+    ),
+    "youtube": (
+        "FORMAT & TONE (YouTube):\n"
+        "- Reference something SPECIFIC from the video or channel to prove authenticity.\n"
+        "- 2-4 sentences. Casual but clear.\n"
+        "- Introduce the product briefly as a solution to the video's topic or pain.\n"
+        "- CTA: 'We made a free tool for this — search [product name] or DM me.'\n"
+        "- Avoid pasting URLs in YouTube comments (they get filtered)."
+    ),
+    "twitter": (
+        "FORMAT & TONE (Twitter / X):\n"
+        "- Ultra-concise: 1-2 punchy sentences, ideally under 220 characters so there's\n"
+        "  room for a short link.\n"
+        "- Lead with the hook — pain or outcome — then name the product.\n"
+        "- 1-2 relevant hashtags max. No emoji overload.\n"
+        "- CTA: a short link or 'DM for a demo.'"
+    ),
+    "naver": (
+        "FORMAT & TONE (Naver / Korean platforms):\n"
+        "- Formal, respectful 존댓말 register. Relationship before pitch.\n"
+        "- 3-4 sentences. Apologise briefly for the unsolicited message.\n"
+        "- State the product's value clearly but modestly — avoid superlatives.\n"
+        "- CTA: polite invitation to learn more, not a hard ask."
+    ),
+    "zhihu": (
+        "FORMAT & TONE (Zhihu):\n"
+        "- Knowledge-first: open with a genuine insight or answer to the question,\n"
+        "  THEN introduce the product as a practical tool for that insight.\n"
+        "- 3-5 sentences or a short structured answer. Quality over brevity.\n"
+        "- Product disclosure should feel educational, not salesy.\n"
+        "- CTA: 'Interested parties are welcome to follow our account for more.'"
+    ),
+    "quora": (
+        "FORMAT & TONE (Quora):\n"
+        "- Answer the question helpfully first — 2-3 sentences of genuine value.\n"
+        "- Then organically introduce the product as one useful resource.\n"
+        "- Use a disclosure: 'Disclosure: I work at [product].'\n"
+        "- 4-6 sentences total. Professional, clear, no buzzwords.\n"
+        "- CTA: 'You can try it free at [product name] — link in my profile.'"
+    ),
+}
+
+_DEFAULT_PLATFORM_STYLE = (
+    "FORMAT & TONE: Conversational but clearly promotional. 3-5 sentences. "
+    "Lead with relevance to the post, then introduce the product and its value, "
+    "then end with one concrete CTA."
+)
+
+
+def get_platform_style(platform: str) -> str:
+    """Return the platform-specific style rules for the given platform slug."""
+    key = (platform or "").lower().strip()
+    return PLATFORM_STYLE_RULES.get(key, _DEFAULT_PLATFORM_STYLE)
+
+
 LOCAL_OUTREACH_PROMPT = """
-Write a short, culturally appropriate REPLY to someone in {country} who wrote the post below. This is a public reply (or DM) on {platform}.
+Write a marketing comment/reply to someone in {country} who wrote the post below.
+Platform: {platform}
 
 Their post:
 \"\"\"
 {source_post_excerpt}
 \"\"\"
 
-About us (DO NOT pitch in first message):
+Our product (YOU MUST pitch this):
 - Product: {product_summary}
-- Pain we address: {pain_point}
+- Pain we solve: {pain_point}
 
 Cultural notes for {country}: {cultural_context}
 
@@ -96,6 +197,9 @@ Outreach voice hint (adapt, don't copy verbatim):
 \"\"\"
 {template_seed}
 \"\"\"
+
+PLATFORM RULES — follow these exactly:
+{platform_style_rules}
 
 CRITICAL — LANGUAGE MATCHING RULE:
 - The post above is written in {post_language_name}. You MUST reply in {post_language_name}.
@@ -105,14 +209,12 @@ CRITICAL — LANGUAGE MATCHING RULE:
   words from any other language. Pure {post_language_name} only.
 - Exception: If the post has no text (empty), reply in {campaign_language_name}.
 
-Other hard rules:
-- Reference SPECIFICALLY what they actually wrote. Show you read their post. Do NOT
-  write a generic message that could have been sent to anyone.
-- 2-4 short sentences max.
-- Do NOT mention our product by name. Hint that we work in this space and ask
-  one curious follow-up question.
-- Tone-match {country} norms and the seed template's voice.
-
+CONTENT rules (ALL required):
+1. Open by referencing SPECIFICALLY what they wrote — show you read their post.
+2. In 1-2 sentences, introduce our product and explain exactly how it solves the pain
+   or opportunity they described. Be specific — name what it does.
+3. End with ONE concrete CTA matched to the platform rules above.
+{correction_note}
 Return ONLY this JSON:
 {{
   "language": "{reply_language}",
@@ -123,30 +225,32 @@ Return ONLY this JSON:
 
 
 COLD_OUTREACH_PROMPT = """
-Write a short, culturally appropriate cold outreach message in {language_name} to a
-professional in {country} who fits our ideal customer profile. This is an initial
-DM on {platform} — there is no prior post to reference.
+Write a cold marketing outreach message in {language_name} to a professional in {country}
+who fits our ideal customer profile. Platform: {platform}
 
 Recipient:
 - Name: {recipient_name}
 - Title / Role: {recipient_title}
 - Company: {recipient_company}
 
-About us (DO NOT pitch in first message):
+Our product (YOU MUST pitch this):
 - Product: {product_summary}
-- Pain we address: {pain_point}
+- Pain we solve: {pain_point}
 
 Cultural notes for {country}: {cultural_context}
 
-Hard rules:
+PLATFORM RULES — follow these exactly:
+{platform_style_rules}
+
+LANGUAGE rules (ALL required):
 - WRITE THE BODY IN {language_name}. Every single word must be in {language_name}.
   Do NOT mix in words from any other language. Pure {language_name} only.
-- Reference their SPECIFIC role or company — show this is not a mass blast.
-- Do NOT mention our product by name. Hint that we work in this space.
-- 2-3 short sentences max. End with one curious follow-up question.
-- Do NOT open with "I hope this finds you well" or any generic opener.
+- Open by referencing their SPECIFIC role or company — personalise the hook.
+- In 1-2 sentences, introduce our product and make it clear how it solves the pain
+  that someone in their role faces. Be direct about what we offer.
+- Do NOT open with "I hope this finds you well."
 - Tone-match {country} norms.
-
+{correction_note}
 Return ONLY this JSON:
 {{
   "language": "{language}",
@@ -158,16 +262,17 @@ Return ONLY this JSON:
 
 SIGNAL_OUTREACH_PROMPT = """
 Write a short, culturally appropriate LinkedIn DM to a likely buyer at a company
-that just produced a buying-intent signal.
+that just produced a buying-intent signal. The goal is to PITCH OUR PRODUCT as
+the perfect fit for their current moment.
 
 Signal type: {signal_type}      (one of: funding | hiring | engagement)
 Signal text: {signal_text}
 Signal source URL: {signal_url}
 Recipient (best guess): {recipient_role} at {company_name}
 
-About us:
+Our product (YOU MUST pitch this):
 - Product: {product_summary}
-- Pain we address: {pain_point}
+- Pain we solve: {pain_point}
 
 Cultural notes for {country}: {cultural_context}
 
@@ -179,14 +284,19 @@ CRITICAL — LANGUAGE MATCHING RULE:
 - LANGUAGE PURITY: Every single word must be in {signal_language_name}. Pure
   {signal_language_name} only — no words from any other language.
 
-Other hard rules:
-- The FIRST sentence MUST reference the SPECIFIC signal:
-    * funding   → congratulate on the raise; reference round / amount if known
-    * hiring    → reference the open req for {recipient_role}; imply you can help
-                  them ramp the new hire faster (or remove the need entirely)
-    * engagement → reference what they engaged with; ask a curious question
-- 3-5 short sentences total. Do NOT pitch the product by name in the first DM.
-- End with one curiosity-driven question, not a meeting ask.
+GTM rules (ALL required):
+- Sentence 1: Reference the SPECIFIC signal to show this is timely and relevant:
+    * funding   → acknowledge the raise briefly (1 short clause), then pivot immediately
+                  to how this growth moment is exactly when our product creates the most
+                  value. Do NOT spend the whole message congratulating — get to the pitch.
+    * hiring    → mention the open role, then explain how our product can help them scale
+                  faster or make that hire unnecessary.
+    * engagement → reference what they engaged with, connect it to our product's value.
+- Sentences 2-3: Clearly introduce our product and explain what it does and why it is
+  the right tool for them RIGHT NOW given this signal. Be specific, not vague.
+- Final sentence: ONE concrete question or soft call-to-action (e.g. "Would it be worth
+  a quick 15-min call to see how [product] fits into your expansion plans?").
+- 3-5 sentences total. Conversational but clearly promotional.
 - Tone-match {country} norms.
 
 Return ONLY this JSON:
@@ -194,74 +304,6 @@ Return ONLY this JSON:
   "language": "{reply_language}",
   "body": "the DM, in {signal_language_name}",
   "english_gloss": "one-line literal translation back to English so a human can sanity-check"
-}}
-""".strip()
-
-
-OPPORTUNITY_CLASSIFICATION_PROMPT = """
-Classify each of these search results as one of: hackathon, event, accelerator, press, community, vc, irrelevant.
-
-Type definitions:
-- hackathon: coding competition or hackathon event
-- event: conference, meetup, summit, or demo day
-- accelerator: startup accelerator or incubator program
-- press: tech media, journalist, news outlet, blog that covers startups in the target industry
-- community: online or in-person founder / developer / startup community
-- vc: venture capital fund, angel network, or government grant program that invests in startups
-- irrelevant: not relevant to the goal
-
-Results:
-{results}
-
-Pick the {limit} most relevant ones for: {goal}, in country: {country}, industry: {industry}.
-Prioritize press contacts (type=press) and VC programs (type=vc) highly — these are direct business impact.
-For press results, try to identify a contact email or contact page URL if visible in the result.
-
-Return ONLY JSON:
-{{
-  "opportunities": [
-    {{
-      "type": "hackathon|event|accelerator|press|community|vc",
-      "title": "...",
-      "url": "...",
-      "summary": "1 sentence why this is a fit",
-      "score": 1-10
-    }}
-  ]
-}}
-""".strip()
-
-
-OPPORTUNITY_PITCH_PROMPT = """
-Write a short pitch in {language_name} aimed at the organizer / editor of this opportunity in {country}. They will read it via a contact form, sponsorship page, or email.
-
-Opportunity:
-- Type: {opp_type}
-- Title: {opp_title}
-- Page summary: {page_excerpt}
-
-About us:
-- Product: {product_summary}
-- Why we are a relevant {opp_type}: {relevance}
-
-Cultural notes for {country}: {cultural_context}
-
-Hard rules:
-- WRITE EVERYTHING IN {language_name}. Every single word must be in {language_name}.
-  Do NOT mix in words from other languages (no "interessant", "rất", "très",
-  or any non-{language_name} word).
-- 4-7 sentences. Concrete, specific, no buzzwords.
-- For hackathons / events: offer to sponsor, mentor, or speak.
-- For press: offer a story angle / data / executive interview.
-- For accelerators / communities: ask how to participate / join / contribute.
-- End with one clear ask + a callback option.
-
-Return ONLY JSON:
-{{
-  "language": "{language}",
-  "subject": "subject line in {language_name}",
-  "body": "the pitch, in {language_name}",
-  "english_gloss": "one-paragraph literal translation back to English"
 }}
 """.strip()
 
@@ -280,7 +322,7 @@ What ONE action should you take right now?
 Respond ONLY as JSON:
 {{
   "action_type": "scan|think|act|wait|escalate",
-  "stream": "people|opportunities",
+  "stream": "people|signals",
   "channel": "linkedin|reddit|naver|quora|zhihu|google|apify",
   "action": "Exact description of what to do",
   "reasoning": "Why this action, why now",

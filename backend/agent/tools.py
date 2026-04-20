@@ -7,7 +7,7 @@ instead of being silently swallowed:
   Apify          — paid actors for LinkedIn / Reddit / native social /
                    Google SERP / website-content-crawler. This is the ONE
                    scraping provider — no Tavily, no Bing, no custom HTTP.
-  Browser-Use    — real-world actions (DMs, comments, contact-form submits)
+  Browser-Use    — real-world actions (DMs, comments, Gmail outreach)
 
 Every public function takes an optional `campaign_id` so that error events can
 be pushed onto the live agent feed for that campaign.
@@ -17,20 +17,21 @@ from __future__ import annotations
 
 import asyncio
 import os
-import re
 from datetime import datetime
 from typing import Any
+import urllib.parse
 from urllib.parse import urlparse
 
-from apify_client import ApifyClient
+from apify_client import ApifyClient, ApifyClientAsync
 from apify_client.errors import ApifyApiError
 
 try:
-    from browser_use_sdk.v3 import AsyncBrowserUse
+    from browser_use_sdk import AsyncBrowserUse
 except Exception:  # pragma: no cover - SDK not installed yet during pip install step
     AsyncBrowserUse = None  # type: ignore[assignment]
 
 _apify: ApifyClient | None = None
+_async_apify: ApifyClientAsync | None = None
 
 
 # ─── Cost guardrail (MAX_APIFY_SPEND_USD) ───────────────────────────────────
@@ -39,16 +40,46 @@ _apify: ApifyClient | None = None
 # soft cap is hit. Per-cycle budgets in `streams/*.py` keep us well below
 # the cap on a normal run; this is the catastrophic-loop kill switch.
 
+# Memory caps per actor (MB). Keeps runs within the free-plan 8 GB total limit.
+# Actors not listed here default to 256 MB — enough for lightweight scrapers.
+_APIFY_MEMORY_MB: dict[str, int] = {
+    "apify/website-content-crawler": 256,
+    "apify/google-search-scraper": 256,
+    "harvestapi/linkedin-post-search": 256,
+    # Reddit — spry_wholemeal is primary (FREE compute-only, no PPE)
+    "spry_wholemeal/reddit-scraper": 256,
+    "trudax/reddit-scraper-lite": 256,
+    # YouTube — streamers/youtube-scraper is primary (jumped to 1024MB 2026-04-17)
+    "streamers/youtube-scraper": 1024,
+    "scrapesmith/youtube-free-search-scraper": 512,
+    # Instagram — official Apify actor is primary (stable schema)
+    # Actor default jumped to 1024MB in build 0.0.470 (2026-04-17); honour it.
+    "apify/instagram-hashtag-scraper": 1024,
+    "instaprism/instagram-hashtag-posts": 512,   # fallback (default 512MB)
+    "sourabhbgp/linkedin-profile-scraper": 256,
+    "piotrv1001/weibo-scraper": 256,
+    "easyapi/rednote-xiaohongshu-search-scraper": 256,
+    "harvestapi/linkedin-profile-search-by-name": 256,
+    "harvestapi/linkedin-profile-scraper": 256,
+    "harvestapi/linkedin-profile-reactions": 256,
+    "harvestapi/linkedin-profile-comments": 256,
+    "fortuitous_pirate/south-korea-dart-scraper": 256,
+    "complex_intricate_networks/fundraising-and-startup-funding-scraper": 256,
+    "complex_intricate_networks/india-startup-vc-intelligence-economic-times-capital-tracker": 256,
+}
+_APIFY_MEMORY_MB_DEFAULT = 256
+
 # Per-result $ estimate per actor. Defaults to $0.005 when absent.
 _APIFY_COST_PER_RESULT: dict[str, float] = {
     "harvestapi/linkedin-post-search": 0.008,
     "trudax/reddit-scraper-lite": 0.0009,
+    "cryptosignals/reddit-scraper-fast": 0.0005,
+    "scrapesmith/youtube-free-search-scraper": 0.00045,
+    "apify/instagram-hashtag-scraper": 0.004,
+    "instaprism/instagram-hashtag-posts": 0.002,
     "apify/google-search-scraper": 0.005,
     "apify/website-content-crawler": 0.0035,
-    "hypebridge/blind-post-scraper": 0.03,
-    "naver_crawling/naver-search-cafe-crawling": 0.10,
-    "huggable_quote/naver-blog-cafe-scraper": 0.005,
-    "oxygenated_quagmire/naver-kin-scraper": 0.005,
+    "sourabhbgp/linkedin-profile-scraper": 0.002,
     "piotrv1001/weibo-scraper": 0.001,
     "easyapi/rednote-xiaohongshu-search-scraper": 0.005,
     "memo23/naukri-scraper": 0.001,
@@ -56,14 +87,13 @@ _APIFY_COST_PER_RESULT: dict[str, float] = {
     "curious_coder/linkedin-jobs-scraper": 0.001,
     "complex_intricate_networks/india-startup-vc-intelligence-economic-times-capital-tracker": 0.01,
     "complex_intricate_networks/fundraising-and-startup-funding-scraper": 0.01,
-    "oxygenated_quagmire/naver-news-scraper": 0.0005,
     "fortuitous_pirate/south-korea-dart-scraper": 0.0035,
     "harvestapi/linkedin-profile-search-by-name": 0.004,
     "harvestapi/linkedin-profile-scraper": 0.004,
     "harvestapi/linkedin-profile-reactions": 0.002,
     "harvestapi/linkedin-profile-comments": 0.002,
-    "clockworks/tiktok-scraper": 0.004,
-    "streamers/youtube-scraper": 0.003,
+    "streamers/youtube-scraper": 0.0024,
+    "spry_wholemeal/reddit-scraper": 0.0002,
 }
 
 # Streams subject to the cap (pulled out so user-initiated UI calls are not
@@ -101,6 +131,13 @@ def _apify_client() -> ApifyClient:
     if _apify is None:
         _apify = ApifyClient(os.getenv("APIFY_API_KEY"))
     return _apify
+
+
+def _async_apify_client() -> ApifyClientAsync:
+    global _async_apify
+    if _async_apify is None:
+        _async_apify = ApifyClientAsync(os.getenv("APIFY_API_KEY"))
+    return _async_apify
 
 
 # ─── Error / status surfacing ───────────────────────────────────────────────
@@ -171,60 +208,126 @@ def _push_tool_event(
 # ─── APIFY — Company analysis (replaces Tavily entirely) ───────────────────
 
 
+def _fetch_page_text(url: str, timeout: float = 10.0) -> tuple[str, str]:
+    """Fetch a URL with httpx and return (title, plain_text).
+
+    Uses Python's built-in html.parser so no extra dependencies are needed.
+    Returns empty strings on any error.
+    """
+    import httpx
+    from html.parser import HTMLParser
+
+    class _TextExtractor(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__()
+            self.chunks: list[str] = []
+            self.title: str = ""
+            self._in_title = False
+            self._skip = False
+
+        def handle_starttag(self, tag: str, attrs: list) -> None:
+            if tag in ("script", "style", "noscript", "head"):
+                self._skip = True
+            if tag == "title":
+                self._in_title = True
+
+        def handle_endtag(self, tag: str) -> None:
+            if tag in ("script", "style", "noscript", "head"):
+                self._skip = False
+            if tag == "title":
+                self._in_title = False
+
+        def handle_data(self, data: str) -> None:
+            stripped = data.strip()
+            if not stripped:
+                return
+            if self._in_title:
+                self.title = stripped
+            elif not self._skip:
+                self.chunks.append(stripped)
+
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; GeoScaleBot/1.0)"}
+        resp = httpx.get(url, headers=headers, timeout=timeout, follow_redirects=True)
+        resp.raise_for_status()
+        parser = _TextExtractor()
+        parser.feed(resp.text)
+        text = " ".join(parser.chunks)
+        return parser.title, text
+    except Exception:
+        return "", ""
+
+
 def analyze_company(company_url: str, campaign_id: str | None = None) -> dict:
     """Read a company's public web presence so the agent can derive ICP / pain.
 
-    Two Apify calls only, NO Tavily:
-      1. `apify/website-content-crawler`  → home page + 3 deep pages of text
-      2. `apify/google-search-scraper`    → 1 page of `"<domain>" customers OR pricing`
+    Website crawl uses direct httpx (no Apify actor) so it doesn't consume
+    a concurrent Apify run slot — leaving all slots free for the people stream
+    so LinkedIn / Reddit / TikTok / YouTube / Instagram all start in parallel.
 
-    The return shape stays compatible with the previous Tavily-based
-    `analyze_company`, exposing a `site_signals` list of {title, summary, url}
-    dicts that the company-analysis prompt already consumes.
+    One Apify call still runs for Google SERP signals:
+      - `apify/google-search-scraper` → `"<domain>" customers OR pricing`
+
+    The return shape exposes a `site_signals` list of {title, summary, url}
+    dicts that the company-analysis prompt consumes.
     """
+    import concurrent.futures
+
     url = company_url if "://" in company_url else f"https://{company_url}"
     parsed = urlparse(url)
     domain = parsed.netloc or parsed.path.split("/")[0]
 
-    site_signals: list[dict] = []
+    # ── Pages to crawl directly via httpx ─────────────────────────────────
+    candidate_paths = ["", "/about", "/pricing", "/product", "/customers"]
+    crawl_urls = [url.rstrip("/") + p for p in candidate_paths]
 
-    # ── 1. Crawl the homepage (cheap, ~$0.014 for 4 pages) ────────────────
-    crawl_items = _apify_run(
-        "apify/website-content-crawler",
-        {
-            "startUrls": [{"url": url}],
-            "maxCrawlPages": 4,
-            "maxCrawlDepth": 1,
-            "crawlerType": "playwright:firefox",
-            "proxyConfiguration": {"useApifyProxy": True},
-        },
-        campaign_id=campaign_id,
-        stream="system",
-        timeout_secs=120,
-        max_items=4,
-    )
-    for it in crawl_items:
-        text = (it.get("text") or it.get("markdown") or "")[:600]
-        if not text:
-            continue
-        site_signals.append(
-            {
-                "title": (it.get("title") or it.get("metadata", {}).get("title") or "")[:200],
-                "summary": text,
-                "url": it.get("url") or url,
-            }
+    def _crawl() -> list[dict]:
+        results: list[dict] = []
+        for page_url in crawl_urls:
+            title, text = _fetch_page_text(page_url)
+            if text:
+                results.append(
+                    {
+                        "title": title[:200],
+                        "summary": text[:600],
+                        "url": page_url,
+                    }
+                )
+            if len(results) >= 4:
+                break
+        return results
+
+    def _serp() -> list[dict]:
+        return google_search(
+            f'"{domain}" (customers OR pricing OR product)',
+            country_code="us",
+            locale="en",
+            max_results=5,
+            campaign_id=campaign_id,
+            stream="system",
         )
 
-    # ── 2. One SERP for "what they sell / who buys" (cheap, ~$0.005) ──────
-    serp = google_search(
-        f'"{domain}" (customers OR pricing OR product)',
-        country_code="us",
-        locale="en",
-        max_results=5,
-        campaign_id=campaign_id,
-        stream="system",
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        future_crawl = pool.submit(_crawl)
+        future_serp = pool.submit(_serp)
+        crawl_items = future_crawl.result()
+        serp_items = future_serp.result()
+
+    site_signals: list[dict] = crawl_items + serp_items
+
+    _push_event(
+        campaign_id,
+        {
+            "type": "scan",
+            "stream": "system",
+            "action": (
+                f"Website crawl complete ({len(crawl_items)} pages via httpx). "
+                f"SERP returned {len(serp_items)} signals."
+            ),
+            "reasoning": "Direct HTTP fetch — no Apify slot consumed for crawl.",
+            "channel": "apify",
+        },
     )
-    site_signals.extend(serp)
 
     return {"site_signals": site_signals, "domain": domain}
 
@@ -267,10 +370,12 @@ def _apify_run(
         campaign_id, "apify", f"Apify start → {actor_id}", stream=stream,
     )
 
+    memory_mb = _APIFY_MEMORY_MB.get(actor_id, _APIFY_MEMORY_MB_DEFAULT)
     try:
         run = apify.actor(actor_id).call(
             run_input=run_input,
             timeout_secs=timeout_secs,
+            memory_mbytes=memory_mb,
         )
     except ApifyApiError as e:
         _push_error(campaign_id, "apify", str(e), actor_id=actor_id, stream=stream)
@@ -333,153 +438,561 @@ def _apify_run(
     return items
 
 
+async def _apify_run_async(
+    actor_id: str,
+    run_input: dict,
+    campaign_id: str | None = None,
+    stream: str = "system",
+    timeout_secs: int = 180,
+    max_items: int = 50,
+) -> list[dict]:
+    """
+    Async version of _apify_run using ApifyClientAsync.
+
+    Truly non-blocking — polls Apify with await asyncio.sleep() instead of
+    blocking a thread. Use this for all platform-agent scraping calls.
+    The sync _apify_run is kept for signals.py and enrichment.py which run
+    in threads via asyncio.to_thread.
+    """
+    apify = _async_apify_client()
+
+    global _apify_spend_usd, _apify_cap_warned
+    cap = _apify_default_cap()
+    if cap > 0 and _apify_spend_usd >= cap and stream in _APIFY_CAPPED_STREAMS:
+        if not _apify_cap_warned:
+            _push_error(
+                campaign_id,
+                "apify",
+                f"MAX_APIFY_SPEND_USD={cap} reached (≈${_apify_spend_usd:.2f}). "
+                "Pausing signals/enrichment runs. Increase the env var to resume.",
+                actor_id=actor_id,
+                stream=stream,
+            )
+            _apify_cap_warned = True
+        return []
+
+    _push_tool_event(
+        campaign_id, "apify", f"Apify start → {actor_id}", stream=stream,
+    )
+
+    memory_mb = _APIFY_MEMORY_MB.get(actor_id, _APIFY_MEMORY_MB_DEFAULT)
+    try:
+        run = await apify.actor(actor_id).call(
+            run_input=run_input,
+            timeout_secs=timeout_secs,
+            memory_mbytes=memory_mb,
+        )
+    except ApifyApiError as e:
+        err_str = str(e)
+        if "memory limit" in err_str.lower() or "exceed" in err_str.lower():
+            _push_error(
+                campaign_id, "apify",
+                f"Apify free-plan memory limit hit for {actor_id}. "
+                "Too many concurrent actor runs. Will retry next cycle.",
+                actor_id=actor_id, stream=stream,
+            )
+        else:
+            _push_error(campaign_id, "apify", err_str, actor_id=actor_id, stream=stream)
+        return []
+    except Exception as e:  # noqa: BLE001
+        _push_error(
+            campaign_id, "apify",
+            f"unexpected: {type(e).__name__}: {e}",
+            actor_id=actor_id, stream=stream,
+        )
+        return []
+
+    if not run or not run.get("defaultDatasetId"):
+        _push_error(
+            campaign_id, "apify",
+            "actor returned no dataset id",
+            actor_id=actor_id, stream=stream,
+        )
+        return []
+
+    status = run.get("status")
+    if status not in (None, "SUCCEEDED"):
+        _push_error(
+            campaign_id, "apify",
+            f"actor finished with status={status}",
+            actor_id=actor_id, stream=stream,
+        )
+
+    items: list[dict] = []
+    try:
+        async for item in apify.dataset(run["defaultDatasetId"]).iterate_items():
+            # Skip NO_RESULTS sentinel — actor signals "zero videos found"
+            # instead of an empty dataset; don't count it as a real item.
+            if isinstance(item, dict) and item.get("error") == "NO_RESULTS":
+                continue
+            items.append(item)
+            if len(items) >= max_items:
+                break
+    except Exception as e:  # noqa: BLE001
+        _push_error(
+            campaign_id, "apify",
+            f"dataset read failed: {e}",
+            actor_id=actor_id, stream=stream,
+        )
+        return items
+
+    est_cost = _apify_cost_estimate(actor_id, len(items))
+    _apify_spend_usd += est_cost
+
+    _push_event(
+        campaign_id,
+        {
+            "type": "scan",
+            "stream": stream,
+            "action": (
+                f"Apify done → {actor_id} ({len(items)} items, est ${est_cost:.3f})"
+            ),
+            "reasoning": (
+                f"Run succeeded. Total Apify spend this session: ≈${_apify_spend_usd:.2f}."
+            ),
+            "channel": "apify",
+        },
+    )
+    return items
+
+
+async def _apify_run_task_async(
+    task_id: str,
+    task_input: dict,
+    *,
+    actor_id_for_cost: str = "trudax/reddit-scraper-lite",
+    campaign_id: str | None = None,
+    stream: str = "system",
+    timeout_secs: int = 180,
+    max_items: int = 50,
+) -> list[dict]:
+    """
+    Run a pre-configured Apify **task** (not a raw actor) and return items.
+
+    Equivalent to the JS:
+        const run = await client.task(task_id).call();
+
+    The task already has its base input saved in the Apify console.
+    `task_input` overrides only the fields we need to vary per call
+    (e.g. startUrls, maxItems).  `actor_id_for_cost` is the underlying
+    actor name, used only for memory-MB lookup and cost estimation.
+    """
+    apify = _async_apify_client()
+
+    global _apify_spend_usd, _apify_cap_warned
+    cap = _apify_default_cap()
+    if cap > 0 and _apify_spend_usd >= cap and stream in _APIFY_CAPPED_STREAMS:
+        if not _apify_cap_warned:
+            _push_error(
+                campaign_id,
+                "apify",
+                f"MAX_APIFY_SPEND_USD={cap} reached (≈${_apify_spend_usd:.2f}). "
+                "Pausing signals/enrichment runs. Increase the env var to resume.",
+                actor_id=task_id,
+                stream=stream,
+            )
+            _apify_cap_warned = True
+        return []
+
+    _push_tool_event(
+        campaign_id, "apify", f"Apify task start → {task_id}", stream=stream,
+    )
+
+    memory_mb = _APIFY_MEMORY_MB.get(actor_id_for_cost, _APIFY_MEMORY_MB_DEFAULT)
+    try:
+        run = await apify.task(task_id).call(
+            task_input=task_input or None,
+            timeout_secs=timeout_secs,
+            memory_mbytes=memory_mb,
+        )
+    except ApifyApiError as e:
+        _push_error(campaign_id, "apify", str(e), actor_id=task_id, stream=stream)
+        return []
+    except Exception as e:  # noqa: BLE001
+        _push_error(
+            campaign_id, "apify",
+            f"unexpected: {type(e).__name__}: {e}",
+            actor_id=task_id, stream=stream,
+        )
+        return []
+
+    if not run or not run.get("defaultDatasetId"):
+        _push_error(
+            campaign_id, "apify",
+            "task returned no dataset id",
+            actor_id=task_id, stream=stream,
+        )
+        return []
+
+    status = run.get("status")
+    if status not in (None, "SUCCEEDED"):
+        _push_error(
+            campaign_id, "apify",
+            f"task finished with status={status}",
+            actor_id=task_id, stream=stream,
+        )
+
+    items: list[dict] = []
+    try:
+        async for item in apify.dataset(run["defaultDatasetId"]).iterate_items():
+            items.append(item)
+            if len(items) >= max_items:
+                break
+    except Exception as e:  # noqa: BLE001
+        _push_error(
+            campaign_id, "apify",
+            f"dataset read failed: {e}",
+            actor_id=task_id, stream=stream,
+        )
+        return items
+
+    est_cost = _apify_cost_estimate(actor_id_for_cost, len(items))
+    _apify_spend_usd += est_cost
+
+    _push_event(
+        campaign_id,
+        {
+            "type": "scan",
+            "stream": stream,
+            "action": (
+                f"Apify task done → {task_id} ({len(items)} items, est ${est_cost:.3f})"
+            ),
+            "reasoning": (
+                f"Run succeeded. Total Apify spend this session: ≈${_apify_spend_usd:.2f}."
+            ),
+            "channel": "apify",
+        },
+    )
+    return items
+
+
 # ─── APIFY — People-stream scrapers ─────────────────────────────────────────
 
 
-def scrape_linkedin_posts(
+async def scrape_linkedin_posts(
     keyword: str,
-    country: str | None = None,  # kept for API compat; not directly used by actor
-    max_results: int = 20,
+    country: str | None = None,
+    max_results: int = 8,
     campaign_id: str | None = None,
+    country_code: str | None = None,
+    locale: str = "en",
+    timeout_secs: int = 180,
 ) -> list[dict]:
     """
     Public LinkedIn posts mentioning a pain-point keyword.
-    Actor: harvestapi/linkedin-post-search (paid, no cookies, reliable).
+
+    Two-source approach:
+      1. harvestapi/linkedin-post-search — dedicated LinkedIn post actor.
+      2. Google site:linkedin.com/posts fallback — always returns content-rich
+         results even when the LinkedIn actor returns blank text fields.
+
+    Results are merged and deduplicated by post URL so scoring has real text
+    to work with, which prevents the all-score-below-5 zero-result problem.
     """
-    items = _apify_run(
+    queries: list[str]
+    if isinstance(keyword, str):
+        geo_keyword = f"{keyword} {country}" if country else keyword
+        queries = [geo_keyword]
+    else:
+        geo_kw = f" {country}" if country else ""
+        queries = [f"{k}{geo_kw}" for k in keyword]
+
+    proxy_cfg: dict = {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]}
+    if country_code:
+        proxy_cfg["apifyProxyCountry"] = country_code.upper()
+
+    # ── Source 1: dedicated LinkedIn post actor ────────────────────────────
+    apify_items = await _apify_run_async(
         "harvestapi/linkedin-post-search",
         {
-            "searchQueries": [keyword] if isinstance(keyword, str) else list(keyword),
+            "searchQueries": queries,
             "maxPosts": max_results,
+            "resultsLimit": max_results,
             "postedLimit": "month",
-            "sortBy": "date",
-            "profileScraperMode": "short",
+            "sortBy": "relevance",
+            "proxyConfiguration": proxy_cfg,
         },
         campaign_id=campaign_id,
         stream="people",
         max_items=max_results,
+        timeout_secs=timeout_secs,
     )
 
-    out: list[dict] = []
-    for item in items:
-        author = item.get("author") or item.get("profile") or {}
-        out.append(
-            {
-                "platform": "linkedin",
-                "name": (
-                    author.get("fullName")
-                    or author.get("name")
-                    or f"{author.get('firstName','')} {author.get('lastName','')}"
-                ).strip()[:120] or "linkedin user",
-                "title": (author.get("headline") or author.get("position") or "")[:160],
-                "company": (author.get("company") or author.get("companyName") or "")[:120],
-                "linkedin_url": author.get("profileUrl")
-                    or author.get("publicProfileUrl")
-                    or item.get("authorUrl")
-                    or "",
-                "source_post_url": item.get("postUrl")
-                    or item.get("url")
-                    or item.get("linkedinUrl")
-                    or "",
-                "source_comment_text": (
-                    item.get("text") or item.get("content") or item.get("postText") or ""
-                )[:600],
-            }
+    def _norm_linkedin_item(item: dict) -> dict:
+        # harvestapi/linkedin-post-search schema (confirmed from live runs):
+        #   item.linkedinUrl       → post URL  (e.g. linkedin.com/posts/...)
+        #   item.content           → post text
+        #   item.author            → dict with keys: name, linkedinUrl, info, publicIdentifier
+        #   item.author.name       → full name
+        #   item.author.linkedinUrl → profile URL (linkedin.com/in/...)
+        #   item.author.info       → headline / job title
+        author = (
+            item.get("author")
+            or item.get("profile")
+            or item.get("authorProfile")
+            or {}
         )
+        name = (
+            author.get("name")
+            or author.get("fullName")
+            or f"{author.get('firstName', '')} {author.get('lastName', '')}".strip()
+            or item.get("authorName")
+            or ""
+        ).strip()[:120] or "linkedin user"
+
+        post_url = (
+            item.get("linkedinUrl")    # harvestapi field for post URL
+            or item.get("postUrl")
+            or item.get("url")
+            or item.get("shareUrl")
+            or ""
+        )
+        text = (
+            item.get("content")        # harvestapi field for post body
+            or item.get("text")
+            or item.get("postText")
+            or item.get("commentary")
+            or ""
+        )[:600]
+
+        # Profile URL: harvestapi uses author.linkedinUrl for the profile link
+        profile_url = (
+            author.get("linkedinUrl")  # harvestapi schema
+            or author.get("profileUrl")
+            or author.get("publicProfileUrl")
+            or item.get("authorUrl")
+            or item.get("authorProfileUrl")
+            or ""
+        )
+
+        return {
+            "platform": "linkedin",
+            "name": name,
+            "title": (
+                author.get("info")         # harvestapi: headline / job title
+                or author.get("headline")
+                or author.get("position")
+                or author.get("title")
+                or ""
+            )[:160],
+            "company": (
+                author.get("company")
+                or author.get("companyName")
+                or author.get("currentCompany")
+                or ""
+            )[:120],
+            "linkedin_url": profile_url,
+            "source_post_url": post_url,
+            "source_comment_text": text,
+        }
+
+    out: list[dict] = [_norm_linkedin_item(i) for i in apify_items]
+
+    # ── Source 2: Google site:linkedin.com/posts — always has text snippets ─
+    # queries[0] is always the English query; use locale="en" so Google doesn't
+    # filter to non-English pages when the campaign language is non-English.
+    serp_query = f'site:linkedin.com/posts {queries[0]}'
+    try:
+        serp_items = await asyncio.to_thread(
+            google_search,
+            serp_query,
+            country_code=country_code or "us",
+            locale="en",
+            max_results=max_results,
+            campaign_id=campaign_id,
+            stream="people",
+        )
+        existing_urls = {r["source_post_url"] for r in out if r["source_post_url"]}
+        for r in serp_items:
+            url = r.get("url", "")
+            if not url or url in existing_urls:
+                continue
+            if "linkedin.com" not in url:
+                continue
+            # Extract a rough name from the URL path
+            try:
+                path_parts = url.rstrip("/").split("/")
+                slug = next((p for p in reversed(path_parts) if p and not p.isdigit()), "")
+                name = slug.replace("-", " ").replace("_", " ").title()[:60] or "LinkedIn User"
+            except Exception:
+                name = "LinkedIn User"
+            out.append({
+                "platform": "linkedin",
+                "name": name,
+                "title": (r.get("title") or "")[:160],
+                "company": "",
+                "linkedin_url": url if "linkedin.com/in/" in url else "",
+                "source_post_url": url,
+                "source_comment_text": (r.get("summary") or r.get("title") or "")[:600],
+            })
+            existing_urls.add(url)
+    except Exception:
+        pass  # SERP fallback is best-effort
+
     return out
 
 
-def scrape_reddit_posts(
+async def scrape_reddit_posts(
     keyword: str,
     subreddits: list[str] | None = None,
-    max_results: int = 30,
+    country: str | None = None,
+    max_results: int = 10,
     campaign_id: str | None = None,
+    country_code: str | None = None,
+    locale: str = "en",
+    timeout_secs: int = 150,
 ) -> list[dict]:
     """
-    Reddit posts/comments matching a keyword.
-    Actor: trudax/reddit-scraper-lite (paid, lite tier).
+    Reddit posts matching a keyword.
+
+    Multi-source strategy (most-reliable first):
+      1. Google SERP site:reddit.com — reliable, uses global Reddit index so
+         country-specific subreddits (r/korea, r/france) that have zero tech
+         posts don't block discovery. Country is passed as a plain text keyword
+         so Google finds discussions that mention the country naturally.
+      2. spry_wholemeal/reddit-scraper — FREE (compute credits only, no PPE).
+         Fires when SERP returns fewer than 3 results.
+
+    Country subreddits (r/korea, r/france) are lifestyle communities that almost
+    never discuss B2B SaaS pain points. We always search globally first so a post
+    in r/webdev, r/programming, or r/startups is found regardless of country.
+    Async — uses ApifyClientAsync for actor calls.
     """
-    start_urls: list[dict] = []
-    if subreddits:
-        for sub in subreddits:
-            sub_clean = sub.strip().lstrip("/").removeprefix("r/")
-            start_urls.append(
-                {"url": f"https://www.reddit.com/r/{sub_clean}/search/?q={keyword}&sort=new&restrict_sr=1"}
-            )
-    else:
-        start_urls.append(
-            {"url": f"https://www.reddit.com/search/?q={keyword}&sort=new"}
+    def _norm_reddit_item(item: dict) -> dict:
+        permalink = item.get("permalink") or item.get("url") or ""
+        post_url = (
+            f"https://www.reddit.com{permalink}"
+            if permalink.startswith("/")
+            else permalink
         )
+        if not post_url:
+            post_url = item.get("link") or item.get("id") or ""
+        return {
+            "platform": "reddit",
+            "name": (
+                item.get("author")
+                or item.get("authorName")
+                or item.get("username")
+                or "redditor"
+            ),
+            "title": (item.get("title") or "")[:160],
+            "company": "",
+            "linkedin_url": "",
+            "source_post_url": post_url,
+            "source_comment_text": (
+                item.get("selftext")
+                or item.get("body")
+                or item.get("text")
+                or item.get("title")
+                or ""
+            )[:600],
+        }
 
-    items = _apify_run(
-        "trudax/reddit-scraper-lite",
-        {
-            "startUrls": start_urls,
-            "maxItems": max_results,
-            "maxPostCount": max_results,
-            "searchPosts": True,
-            "searchComments": False,
-            "searchCommunities": False,
-            "searchUsers": False,
-            "skipComments": True,
-            "skipUserPosts": True,
-            "skipCommunity": True,
-            "sort": "new",
-            "time": "month",
-            "proxy": {"useApifyProxy": True},
-        },
-        campaign_id=campaign_id,
-        stream="people",
-        max_items=max_results,
-    )
+    def _norm_reddit_serp(r: dict) -> dict | None:
+        url = r.get("url", "")
+        if not url or "reddit.com" not in url:
+            return None
+        return {
+            "platform": "reddit",
+            "name": "redditor",
+            "title": "",
+            "company": "",
+            "linkedin_url": "",
+            "source_post_url": url,
+            "source_comment_text": (r.get("summary") or r.get("title") or "")[:600],
+        }
 
-    out: list[dict] = []
-    for item in items:
-        out.append(
+    # ── Primary: Google SERP — global site:reddit.com search ────────────────
+    # Always search globally. Country subreddits (r/korea, r/france) are
+    # lifestyle communities with zero SaaS/tech discussion. Country is appended
+    # as plain text so Google finds posts that mention the country naturally.
+    clean_kw = keyword.replace('"', "").replace(" OR ", " ").strip()
+    serp_query = f"site:reddit.com {clean_kw}"
+    if country:
+        serp_query += f" {country}"
+
+    try:
+        serp_items = await asyncio.to_thread(
+            google_search,
+            serp_query,
+            country_code=country_code or "us",
+            locale=locale or "en",
+            max_results=max_results,
+            campaign_id=campaign_id,
+            stream="people",
+        )
+        out: list[dict] = [r for r in (_norm_reddit_serp(i) for i in serp_items) if r]
+    except Exception:
+        out = []
+
+    # ── Fallback: spry_wholemeal/reddit-scraper (FREE — compute credits only) ─
+    if len(out) < 3:
+        queries = [clean_kw]
+        if country:
+            queries = [f"{clean_kw} {country}"]
+
+        actor_items = await _apify_run_async(
+            "spry_wholemeal/reddit-scraper",
             {
-                "platform": "reddit",
-                "name": item.get("username") or item.get("author") or "redditor",
-                "title": (item.get("title") or "")[:160],
-                "company": "",
-                "linkedin_url": "",
-                "source_post_url": item.get("url") or "",
-                "source_comment_text": (
-                    item.get("body") or item.get("text") or item.get("title") or ""
-                )[:600],
-            }
+                "search": {
+                    "queries": queries,
+                    "maxPostsPerQuery": max_results,
+                    "sort": "relevance",
+                },
+            },
+            campaign_id=campaign_id,
+            stream="people",
+            max_items=max_results,
+            timeout_secs=timeout_secs,
         )
+        existing_urls = {r["source_post_url"] for r in out if r["source_post_url"]}
+        for item in actor_items:
+            normed = _norm_reddit_item(item)
+            if normed["source_post_url"] and normed["source_post_url"] not in existing_urls:
+                out.append(normed)
+                existing_urls.add(normed["source_post_url"])
+
     return out
 
 
 # ─── APIFY — TikTok scraper ──────────────────────────────────────────────────
 
 
-def scrape_tiktok_posts(
+async def scrape_tiktok_posts(
     keyword: str,
-    max_results: int = 15,
+    max_results: int = 8,
     campaign_id: str | None = None,
+    country_code: str | None = None,
+    timeout_secs: int = 90,
 ) -> list[dict]:
     """
     TikTok videos matching a keyword/hashtag query.
     Actor: clockworks/tiktok-scraper.
-
-    The keyword is stripped of Boolean operators (OR / quotes) since TikTok
-    search is hashtag/keyword-based, not boolean-query-based.
+    Async — uses ApifyClientAsync so the event loop stays free while waiting.
     """
     clean_keyword = keyword.replace('"', "").replace(" OR ", " ").strip()
 
-    items = _apify_run(
+    run_input: dict = {
+        "searchQueries": [clean_keyword],
+        "maxItems": max_results,
+        "shouldDownloadVideos": False,
+        "shouldDownloadCovers": False,
+        "shouldDownloadSubtitles": False,
+    }
+    if country_code:
+        run_input["proxyConfiguration"] = {
+            "useApifyProxy": True,
+            "apifyProxyGroups": ["RESIDENTIAL"],
+            "apifyProxyCountry": country_code.upper(),
+        }
+
+    items = await _apify_run_async(
         "clockworks/tiktok-scraper",
-        {
-            "searchQueries": [clean_keyword],
-            "maxItems": max_results,
-            "shouldDownloadVideos": False,
-            "shouldDownloadCovers": False,
-            "shouldDownloadSubtitles": False,
-        },
+        run_input,
         campaign_id=campaign_id,
         stream="people",
         max_items=max_results,
+        timeout_secs=timeout_secs,
     )
 
     out: list[dict] = []
@@ -509,66 +1022,255 @@ def scrape_tiktok_posts(
 # ─── APIFY — YouTube video search ──────────────────────────────────────────
 
 
-def scrape_youtube_videos(
+async def scrape_youtube_videos(
     keyword: str,
-    max_results: int = 15,
+    max_results: int = 20,
     campaign_id: str | None = None,
+    gl: str | None = None,
+    hl: str | None = None,
+    timeout_secs: int = 60,
 ) -> list[dict]:
     """
     YouTube videos matching a keyword query.
-    Actor: streamers/youtube-scraper.
-
-    Boolean operators are stripped since YouTube search is plain-text only.
-    The video description is used as source_comment_text so the LLM can craft
-    a reply referencing what the creator/community discussed.
+    Primary: streamers/youtube-scraper (PPE $2.40/1k, high reliability).
+    Fallback 1: scrapesmith/youtube-free-search-scraper (PPE $0.45/1k, cheapest).
+    Fallback 2: Google SERP site:youtube.com (always works).
+    Async — uses ApifyClientAsync.
     """
-    from urllib.parse import quote_plus
-
     clean_keyword = keyword.replace('"', "").replace(" OR ", " ").strip()
-    search_url = f"https://www.youtube.com/results?search_query={quote_plus(clean_keyword)}"
 
-    items = _apify_run(
-        "streamers/youtube-scraper",
-        {
-            "startUrls": [{"url": search_url}],
-            "maxResults": max_results,
-            "type": "video",
-            "proxy": {"useApifyProxy": True},
-        },
-        campaign_id=campaign_id,
-        stream="people",
-        max_items=max_results,
-    )
-
-    out: list[dict] = []
-    for item in items:
+    def _norm_yt_item(item: dict) -> dict | None:
         video_url = (
             item.get("url")
             or item.get("videoUrl")
-            or item.get("id") and f"https://www.youtube.com/watch?v={item['id']}"
+            or item.get("video_url")          # scrapesmith snake_case
+            or item.get("watchUrl")
+            or (item.get("videoId") and f"https://www.youtube.com/watch?v={item['videoId']}")
+            or (item.get("video_id") and f"https://www.youtube.com/watch?v={item['video_id']}")
+            or (item.get("id") and f"https://www.youtube.com/watch?v={item['id']}")
             or ""
         )
-        if not video_url:
-            continue
+        if not video_url or "youtube.com" not in video_url:
+            return None
         channel_name = (
             item.get("channelName")
+            or item.get("channel_name")        # scrapesmith snake_case
+            or item.get("channelTitle")
             or item.get("channel")
             or item.get("ownerChannelName")
+            or item.get("author")
             or "YouTube user"
         )
-        out.append(
-            {
-                "platform": "youtube",
-                "name": str(channel_name)[:120],
-                "title": (item.get("title") or "")[:160],
-                "company": "",
-                "linkedin_url": "",
-                "source_post_url": video_url,
-                "source_comment_text": (
-                    item.get("description") or item.get("title") or ""
-                )[:600],
-            }
+        return {
+            "platform": "youtube",
+            "name": str(channel_name)[:120],
+            "title": (item.get("title") or "")[:160],
+            "company": "",
+            "linkedin_url": "",
+            "source_post_url": video_url,
+            "source_comment_text": (
+                item.get("description") or item.get("title") or ""
+            )[:600],
+        }
+
+    # ── Primary: streamers/youtube-scraper ───────────────────────────────────
+    actor_input: dict = {
+        "searchQueries": [clean_keyword],
+        "maxResults": max_results,
+        "maxResultsShorts": 0,
+        "maxResultStreams": 0,
+        "startUrls": [],
+    }
+    if gl:
+        actor_input["gl"] = gl.upper()
+    if hl:
+        actor_input["hl"] = hl.lower()
+
+    items = await _apify_run_async(
+        "streamers/youtube-scraper",
+        actor_input,
+        campaign_id=campaign_id,
+        stream="people",
+        max_items=max_results,
+        timeout_secs=timeout_secs,
+    )
+    out: list[dict] = [r for r in (_norm_yt_item(i) for i in items) if r]
+
+    # ── Fallback 1: scrapesmith/youtube-free-search-scraper (cheapest PPE) ───
+    if not out:
+        fb1_input: dict = {
+            "searchQueries": [clean_keyword],
+            "maxResultsPerQuery": max_results,
+        }
+        fb1_items = await _apify_run_async(
+            "scrapesmith/youtube-free-search-scraper",
+            fb1_input,
+            campaign_id=campaign_id,
+            stream="people",
+            max_items=max_results,
+            timeout_secs=timeout_secs,
         )
+        out = [r for r in (_norm_yt_item(i) for i in fb1_items) if r]
+
+    # ── Fallback 2: Google SERP site:youtube.com ─────────────────────────────
+    if not out:
+        try:
+            serp_items = await asyncio.to_thread(
+                google_search,
+                f"site:youtube.com {clean_keyword}",
+                country_code=(gl or "us").lower(),
+                locale=(hl or "en").lower(),
+                max_results=max_results,
+                campaign_id=campaign_id,
+                stream="people",
+            )
+            for r in serp_items:
+                url = r.get("url", "")
+                if "youtube.com/watch" not in url:
+                    continue
+                out.append({
+                    "platform": "youtube",
+                    "name": "YouTube user",
+                    "title": (r.get("title") or "")[:160],
+                    "company": "",
+                    "linkedin_url": "",
+                    "source_post_url": url,
+                    "source_comment_text": (r.get("summary") or r.get("title") or "")[:600],
+                })
+        except Exception:
+            pass
+
+    return out
+
+
+# ─── APIFY — Instagram post search ──────────────────────────────────────────
+
+
+def _sanitize_hashtag(tag: str) -> str:
+    """Strip chars that apify/instagram-hashtag-scraper rejects (spaces, punctuation, symbols)."""
+    import re as _re
+    return _re.sub(r'[!?.,:;\-+=*&%$#@/\\~^|<>()\[\]{}"\'`\s]', "", tag)
+
+
+async def scrape_instagram_posts(
+    keyword: str,
+    country: str | None = None,
+    max_results: int = 8,
+    campaign_id: str | None = None,
+    local_country_name: str | None = None,
+    country_code: str | None = None,
+    timeout_secs: int = 180,
+    english_keyword: str | None = None,
+) -> list[dict]:
+    """
+    Instagram posts/reels matching a keyword or hashtag.
+    Actor: apify/instagram-hashtag-scraper (official, stable schema).
+    Fallback 1: instaprism/instagram-hashtag-posts.
+    Fallback 2: retry primary/fallback with english_keyword when local tags yield nothing.
+
+    Hashtags are built from individual keywords (no country concatenation).
+    "#scalability" finds thousands of posts; "#scalabilityUnitedStates" finds zero.
+    """
+
+    def _build_hashtags(kw: str, add_local: bool = True) -> list[str]:
+        clean = kw.replace('"', "").replace(" OR ", " ").strip()
+        words = [w for w in clean.split() if len(w) > 3]
+        tags: list[str] = words[:3] if words else [clean.replace(" ", "")]
+        if add_local and local_country_name and local_country_name != country and local_country_name not in clean:
+            local_words = [w for w in local_country_name.split() if len(w) > 2]
+            if local_words:
+                tags = (local_words[:1] + tags)[:3]
+        sanitized = [_sanitize_hashtag(t) for t in tags]
+        return [t for t in sanitized if t]
+
+    hashtags = _build_hashtags(keyword)
+
+    def _norm_ig_item(item: dict) -> dict | None:
+        # Handles both apify/instagram-hashtag-scraper and instaprism schemas
+        owner = (
+            item.get("ownerUsername")          # apify official
+            or item.get("owner")               # instaprism (string username)
+            or item.get("username")
+            or (item.get("ownerFullName") and item["ownerFullName"])
+            or "instagram_user"
+        )
+        # owner can be a dict (apify sometimes nests it)
+        if isinstance(owner, dict):
+            owner = owner.get("username") or owner.get("id") or "instagram_user"
+
+        post_url = (
+            item.get("url")
+            or item.get("postUrl")
+            or (item.get("shortcode") and f"https://www.instagram.com/p/{item['shortcode']}/")
+            or (item.get("shortCode") and f"https://www.instagram.com/p/{item['shortCode']}/")
+            or ""
+        )
+        if not post_url:
+            return None
+
+        caption = (
+            item.get("caption")
+            or item.get("text")
+            or item.get("alt")
+            or item.get("accessibility_caption")
+            or ""
+        )[:600]
+
+        return {
+            "platform": "instagram",
+            "name": str(owner)[:120],
+            "title": "",
+            "company": "",
+            "linkedin_url": "",
+            "source_post_url": post_url,
+            "source_comment_text": caption,
+        }
+
+    async def _run_primary(tags: list[str]) -> list[dict]:
+        items = await _apify_run_async(
+            "apify/instagram-hashtag-scraper",
+            {
+                "hashtags": tags,
+                "resultsLimit": max_results,
+                "proxy": {
+                    "useApifyProxy": True,
+                    "apifyProxyGroups": ["RESIDENTIAL"],
+                },
+            },
+            campaign_id=campaign_id,
+            stream="people",
+            max_items=max_results,
+            timeout_secs=timeout_secs,
+        )
+        return [r for r in (_norm_ig_item(i) for i in items) if r]
+
+    async def _run_fallback(tags: list[str]) -> list[dict]:
+        items = await _apify_run_async(
+            "instaprism/instagram-hashtag-posts",
+            {
+                "hashtags": tags[:2],
+                "limit": max_results,
+            },
+            campaign_id=campaign_id,
+            stream="people",
+            max_items=max_results,
+            timeout_secs=timeout_secs,
+        )
+        return [r for r in (_norm_ig_item(i) for i in items) if r]
+
+    # ── Pass 1: local-language hashtags ───────────────────────────────────
+    out = await _run_primary(hashtags)
+    if not out:
+        out = await _run_fallback(hashtags)
+
+    # ── Pass 2: English hashtags (for non-English campaigns that got zero) ─
+    if not out and english_keyword and english_keyword != keyword:
+        en_tags = _build_hashtags(english_keyword, add_local=False)
+        if en_tags != hashtags:
+            out = await _run_primary(en_tags)
+            if not out:
+                out = await _run_fallback(en_tags)
+
     return out
 
 
@@ -711,72 +1413,6 @@ def scrape_native_social(
     return out
 
 
-# ─── APIFY — Opportunity discovery + contact-page resolution ───────────────
-
-
-def find_opportunity_listings(
-    queries: list[str],
-    country_code: str,
-    locale: str,
-    max_per_query: int = 8,
-    campaign_id: str | None = None,
-) -> list[dict]:
-    """Run the configured opportunity queries and return raw SERP results."""
-    out: list[dict] = []
-    for q in queries:
-        out.extend(
-            google_search(
-                q,
-                country_code=country_code,
-                locale=locale,
-                max_results=max_per_query,
-                campaign_id=campaign_id,
-                stream="opportunities",
-            )
-        )
-    return out
-
-
-def crawl_contact_page(
-    url: str,
-    campaign_id: str | None = None,
-) -> dict:
-    """
-    Use the Apify website-content-crawler to read an opportunity's landing page
-    and extract a contact email or contact form URL.
-    """
-    items = _apify_run(
-        "apify/website-content-crawler",
-        {
-            "startUrls": [{"url": url}],
-            "maxCrawlPages": 4,
-            "maxCrawlDepth": 1,
-            "crawlerType": "playwright:firefox",
-            "proxyConfiguration": {"useApifyProxy": True},
-        },
-        campaign_id=campaign_id,
-        stream="opportunities",
-        timeout_secs=120,
-        max_items=4,
-    )
-
-    text_blob = ""
-    contact_url = ""
-    for it in items:
-        text_blob += "\n" + (it.get("text") or "")[:5000]
-        u = it.get("url", "")
-        if not contact_url and ("contact" in u.lower() or "apply" in u.lower()):
-            contact_url = u
-
-    email_match = re.search(
-        r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text_blob
-    )
-    return {
-        "contact_email": email_match.group(0) if email_match else "",
-        "contact_url": contact_url or url,
-        "page_excerpt": text_blob.strip()[:1200],
-    }
-
 
 # ─── BROWSER-USE — Real world actions ───────────────────────────────────────
 
@@ -796,13 +1432,12 @@ def _bu() -> "AsyncBrowserUse":
             "and restart the server so the agent can actually post DMs / comments."
         )
     if _bu_client is None:
-        _bu_client = AsyncBrowserUse()
+        _bu_client = AsyncBrowserUse(api_key=os.getenv("BROWSER_USE_API_KEY"))
     return _bu_client
 
 
-# "idle" = browser initialising, not yet running — NOT a terminal state.
-# Lifecycle: created → idle → running → stopped / timed_out / error.
-_BU_TERMINAL_STATUSES = {"stopped", "timed_out", "error"}
+# v2 SDK task lifecycle: created → started → finished / stopped
+_BU_TERMINAL_STATUSES = {"finished", "stopped"}
 
 
 async def browser_use_task(
@@ -811,16 +1446,13 @@ async def browser_use_task(
     stream: str = "system",
     description: str | None = None,
 ) -> dict[str, Any]:
-    """Run a natural-language task in the cloud browser.
+    """Run a natural-language task in the cloud browser (SDK v2).
 
-    Creates the session up-front so the live_url (iframe-embeddable) is
-    surfaced to the dashboard the instant the browser opens — not after the
-    task finishes. We then poll the session to completion.
+    Creates the browser session first so the live_url is available immediately,
+    then submits the task into that session. Polls the task status to completion.
 
-    Always forwards the persistent Browser Use Cloud profile (cookies for
-    LinkedIn, Reddit, etc.), the agreed agent model, and the residential
-    proxy region — all sourced from env so they can be rotated without code
-    changes.
+    Profile, model, and proxy are sourced from env vars so they can be rotated
+    without code changes.
     """
     profile_id = os.getenv("BROWSER_USE_PROFILE_ID") or None
     model = os.getenv("BROWSER_USE_MODEL") or None
@@ -834,31 +1466,37 @@ async def browser_use_task(
         breadcrumb += "]"
     _push_tool_event(campaign_id, "browser-use", breadcrumb, stream=stream)
 
-    create_kwargs: dict[str, Any] = {}
-    if profile_id:
-        create_kwargs["profile_id"] = profile_id
-    if model:
-        create_kwargs["model"] = model
-    if proxy:
-        create_kwargs["proxy_country_code"] = proxy
+    global _bu_credits_exhausted
+
+    # Short-circuit: don't hammer the API if we already know credits are gone.
+    if _bu_credits_exhausted:
+        return {
+            "success": False,
+            "error": "Browser-Use credits exhausted — top up at https://cloud.browser-use.com",
+        }
 
     try:
         bu = _bu()
     except Exception as e:  # noqa: BLE001
-        # Most common cause: BROWSER_USE_API_KEY not set or SDK missing.
-        # Surface this as an `error` event so it shows up red in the feed
-        # instead of silently swallowing the outreach attempt.
         _push_error(campaign_id, "browser-use", str(e), stream=stream)
         return {"success": False, "error": str(e)}
 
     live_url: str | None = None
+    session_id: str | None = None
+    task_id: str | None = None
     try:
-        session = await bu.sessions.create(task, **create_kwargs)
+        # ── Step 1: create the browser session (profile/proxy attached here) ─
+        session_kwargs: dict[str, Any] = {}
+        if profile_id:
+            session_kwargs["profile_id"] = profile_id
+        if proxy:
+            session_kwargs["proxy_country_code"] = proxy.lower()
+
+        session = await bu.sessions.create(**session_kwargs)
         session_id = str(session.id)
         live_url = getattr(session, "live_url", None)
 
-        # Surface the live URL immediately so the dashboard iframe can
-        # connect while the agent is still working.
+        # Surface the live URL immediately so the dashboard can embed it.
         _push_event(
             campaign_id,
             {
@@ -871,18 +1509,19 @@ async def browser_use_task(
             },
         )
 
-        # Poll until the session reaches a terminal state.
-        deadline = asyncio.get_event_loop().time() + 14400  # 4h cap
-        out: str | None = None
-        while asyncio.get_event_loop().time() < deadline:
-            current = await bu.sessions.get(session_id)
-            status = getattr(current.status, "value", str(current.status))
-            if status in _BU_TERMINAL_STATUSES:
-                out = getattr(current, "output", None)
-                break
-            await asyncio.sleep(2)
-        else:
-            raise TimeoutError(f"browser-use session {session_id} timed out")
+        # ── Step 2: submit the task into the session ──────────────────────────
+        task_kwargs: dict[str, Any] = {"task": task, "session_id": session_id}
+        if model:
+            task_kwargs["llm"] = model
+        task_resp = await bu.tasks.create(**task_kwargs)
+        task_id = str(task_resp.id)
+
+        # ── Step 3: poll task status to completion ────────────────────────────
+        # tasks.wait() handles polling internally using the correct status enum.
+        # Raises TimeoutError if the task doesn't finish within the deadline.
+        task_view = await bu.tasks.wait(task_id, timeout=14400, interval=2)
+        out = getattr(task_view, "output", None)
+        success = bool(getattr(task_view, "is_success", False))
 
         _push_event(
             campaign_id,
@@ -896,10 +1535,27 @@ async def browser_use_task(
                 "session_ended": True,
             },
         )
-        return {"success": True, "output": out, "live_url": live_url}
+        return {"success": success, "output": out, "live_url": live_url}
     except Exception as e:  # noqa: BLE001
-        # If the session was already created and surfaced to the dashboard,
-        # mark it as ended so the UI doesn't keep showing it as live.
+        err_str = str(e)
+        # Detect Browser-Use 402 (insufficient credits) and emit ONE clear
+        # actionable error instead of a cryptic per-outreach failure.
+        if "402" in err_str and "credit" in err_str.lower():
+            if not _bu_credits_exhausted:
+                _bu_credits_exhausted = True
+                _push_error(
+                    campaign_id,
+                    "browser-use",
+                    (
+                        "Browser-Use credits exhausted — outreach paused. "
+                        "Top up at https://cloud.browser-use.com to resume. "
+                        f"({err_str[:200]})"
+                    ),
+                    stream=stream,
+                )
+            return {"success": False, "error": err_str}
+
+        _bu_credits_exhausted = False  # reset if we get a different error
         if live_url:
             _push_event(
                 campaign_id,
@@ -907,14 +1563,14 @@ async def browser_use_task(
                     "type": "act",
                     "stream": stream,
                     "action": description or "browser-use: session failed",
-                    "reasoning": str(e)[:400],
+                    "reasoning": err_str[:400],
                     "channel": "browser-use",
                     "live_url": live_url,
                     "session_ended": True,
                 },
             )
-        _push_error(campaign_id, "browser-use", str(e), stream=stream)
-        return {"success": False, "error": str(e)}
+        _push_error(campaign_id, "browser-use", err_str, stream=stream)
+        return {"success": False, "error": err_str}
 
 
 _AUTH_GUARD = (
@@ -924,6 +1580,10 @@ _AUTH_GUARD = (
     "If you hit a login wall, security checkpoint, CAPTCHA, or any step-up "
     "auth, abort immediately and return exactly: auth_required."
 )
+
+# Tracks whether Browser-Use is currently out of credits so we can surface
+# a single clear error instead of one per outreach attempt.
+_bu_credits_exhausted: bool = False
 
 
 async def post_linkedin_comment(
@@ -1051,6 +1711,27 @@ async def post_youtube_comment(
     )
 
 
+async def post_instagram_comment(
+    post_url: str,
+    comment: str,
+    campaign_id: str | None = None,
+) -> dict:
+    task = f"""
+    Open the Instagram post: {post_url}
+    {_AUTH_GUARD}
+    Locate the comment input field below the post.
+    Click to focus the input field.
+    Type exactly this comment: {comment}
+    Press Enter or click the "Post" button to submit.
+    Verify the comment appears before returning.
+    Return: success with the posted comment URL, or auth_required, or the verbatim error.
+    """.strip()
+    return await browser_use_task(
+        task, campaign_id=campaign_id, stream="people",
+        description=f"Instagram comment → {post_url[:60]}",
+    )
+
+
 async def post_native_comment(
     post_url: str,
     comment: str,
@@ -1079,45 +1760,27 @@ async def send_gmail(
     body: str,
     campaign_id: str | None = None,
 ) -> dict:
-    """Open Gmail (already signed in via Browser Use profile) and send an email."""
+    """Open Gmail and send an email. Logs in if the session is not already active."""
     task = f"""
-    Open https://mail.google.com/mail/u/0/#compose
-    {_AUTH_GUARD}
-    A compose window should open automatically. If it does not, click the Compose button.
+    Navigate to https://mail.google.com in the browser.
+    If you are presented with a Google sign-in page, sign in using the account
+    credentials stored in the browser profile (cookies should restore the session
+    automatically — if they do, skip the sign-in step).
+    Do NOT visit LinkedIn, Twitter, or any other site.
+    Once inside Gmail, click the Compose button (or use the URL
+    https://mail.google.com/mail/u/0/#compose to open a compose window directly).
     Fill in the To field with: {to_email}
     Fill in the Subject field with: {subject}
     Fill in the body with exactly: {body}
     Click the Send button.
-    Confirm "Message sent" or equivalent confirmation appears before returning.
-    Return: success, or auth_required, or the verbatim error.
+    Confirm "Message sent" or an equivalent confirmation appears before returning.
+    Return exactly one of: success, auth_required (if login failed), or the verbatim error message.
     """.strip()
     return await browser_use_task(
         task, campaign_id=campaign_id, stream="people",
         description=f"Gmail → {to_email[:60]}",
     )
 
-
-async def submit_contact_form(
-    contact_url: str,
-    pitch: str,
-    campaign_id: str | None = None,
-    sender_email: str | None = None,
-) -> dict:
-    """Open a contact / call-for-speakers / press page and submit a pitch."""
-    sender = sender_email or os.getenv("CONTACT_FROM_EMAIL", "outreach@example.com")
-    task = f"""
-    Open {contact_url}.
-    Find the contact form, sponsorship form, or "call for speakers" form.
-    If the page is a press-release contact page, find the listed email and stop —
-    return that email so the caller can send manually.
-    Otherwise, fill the form. Use sender email: {sender}. Subject: Partnership inquiry.
-    Body: {pitch}
-    Submit the form. Confirm success or capture the error message verbatim.
-    """.strip()
-    return await browser_use_task(
-        task, campaign_id=campaign_id, stream="opportunities",
-        description=f"contact form → {contact_url[:60]}",
-    )
 
 
 # ─── helpers ────────────────────────────────────────────────────────────────
@@ -1153,15 +1816,16 @@ def _author_from_url(url: str) -> str:
 
 
 # Kept for backward compatibility with any old imports.
-def find_linkedin_leads(search_query: str, max_results: int = 20) -> list[dict]:
-    return scrape_linkedin_posts(search_query, max_results=max_results)
+# scrape_linkedin_posts is async — callers must await this coroutine.
+async def find_linkedin_leads(search_query: str, max_results: int = 20) -> list[dict]:
+    return await scrape_linkedin_posts(search_query, max_results=max_results)
 
 
 def healthcheck_apify() -> dict:
     """Verify the API key works AND that one actor in each category is alive.
 
     Per-category checks (cheap — fetches actor metadata only, no run):
-      - platform   : `hypebridge/blind-post-scraper`
+      - platform   : `naver_crawling/naver-search-cafe-crawling`
       - signal     : `complex_intricate_networks/fundraising-and-startup-funding-scraper`
       - enrichment : `harvestapi/linkedin-profile-search-by-name`
 
@@ -1178,7 +1842,7 @@ def healthcheck_apify() -> dict:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
     categories = {
-        "platform": "hypebridge/blind-post-scraper",
+        "platform": "naver_crawling/naver-search-cafe-crawling",
         "signal": "complex_intricate_networks/fundraising-and-startup-funding-scraper",
         "enrichment": "harvestapi/linkedin-profile-search-by-name",
     }

@@ -4,23 +4,16 @@ import { useEffect, useMemo, useState } from 'react'
 import { notFound, useParams } from 'next/navigation'
 import Link from 'next/link'
 import LeadDetailCard from '@/components/LeadDetailCard'
-import OpportunityDetailCard from '@/components/OpportunityDetailCard'
-import { getCampaign, getLeads, getOpportunities } from '@/lib/api'
-import type { Campaign, Lead, Opportunity } from '@/lib/types'
+import { getCampaign, getLeads } from '@/lib/api'
+import type { Campaign, Lead } from '@/lib/types'
 
 type BucketSlug =
   | 'people'
   | 'contacted'
-  | 'replied'
-  | 'opportunities'
-  | 'pitches'
-  | 'meetings'
 
 interface BucketConfig {
   title: string
-  source: 'leads' | 'opportunities'
   leadFilter?: (l: Lead) => boolean
-  oppFilter?: (o: Opportunity) => boolean
   emptyLabel: string
   statuses: string
 }
@@ -28,58 +21,20 @@ interface BucketConfig {
 const BUCKETS: Record<BucketSlug, BucketConfig> = {
   people: {
     title: 'People found',
-    source: 'leads',
     leadFilter: () => true,
     emptyLabel: '› no people found yet — agent is still scanning…',
     statuses: 'all statuses',
   },
   contacted: {
     title: 'People contacted',
-    source: 'leads',
     leadFilter: (l) =>
       l.status === 'contacted' || l.status === 'replied' || l.status === 'meeting',
     emptyLabel: '› no outreach sent yet — agent is still drafting…',
     statuses: 'contacted · replied · meeting',
   },
-  replied: {
-    title: 'Replied',
-    source: 'leads',
-    leadFilter: (l) => l.status === 'replied' || l.status === 'meeting',
-    emptyLabel: '› no replies yet — agent is waiting on inboxes…',
-    statuses: 'replied · meeting',
-  },
-  opportunities: {
-    title: 'Opportunities',
-    source: 'opportunities',
-    oppFilter: () => true,
-    emptyLabel: '› no opportunities yet — agent is still sweeping…',
-    statuses: 'all statuses',
-  },
-  pitches: {
-    title: 'Pitches sent',
-    source: 'opportunities',
-    oppFilter: (o) =>
-      o.status === 'contacted' || o.status === 'replied' || o.status === 'booked',
-    emptyLabel: '› no pitches sent yet — agent is still drafting…',
-    statuses: 'contacted · replied · booked',
-  },
-  meetings: {
-    title: 'Meetings',
-    source: 'leads',
-    leadFilter: (l) => l.status === 'meeting',
-    emptyLabel: '› no meetings booked yet…',
-    statuses: 'meeting',
-  },
 }
 
-const VALID: BucketSlug[] = [
-  'people',
-  'contacted',
-  'replied',
-  'opportunities',
-  'pitches',
-  'meetings',
-]
+const VALID: BucketSlug[] = ['people', 'contacted']
 
 export default function BucketPage() {
   const params = useParams<{ marketId: string; bucket: string }>()
@@ -94,7 +49,6 @@ export default function BucketPage() {
 
   const [campaign, setCampaign] = useState<Campaign | null>(null)
   const [leads, setLeads] = useState<Lead[]>([])
-  const [opps, setOpps] = useState<Opportunity[]>([])
   const [loaded, setLoaded] = useState(false)
   const [error, setError] = useState(false)
 
@@ -104,15 +58,10 @@ export default function BucketPage() {
 
     const load = async () => {
       try {
-        const tasks: Promise<unknown>[] = [
+        await Promise.all([
           getCampaign(campaignId).then((c) => { if (!cancelled) setCampaign(c) }),
-        ]
-        if (cfg.source === 'leads') {
-          tasks.push(getLeads(campaignId).then((d) => { if (!cancelled) setLeads(d) }))
-        } else {
-          tasks.push(getOpportunities(campaignId).then((d) => { if (!cancelled) setOpps(d) }))
-        }
-        await Promise.all(tasks)
+          getLeads(campaignId).then((d) => { if (!cancelled) setLeads(d) }),
+        ])
         if (!cancelled) { setLoaded(true); setError(false) }
       } catch {
         if (!cancelled) { setLoaded(true); setError(true) }
@@ -125,18 +74,14 @@ export default function BucketPage() {
       cancelled = true
       clearInterval(interval)
     }
-  }, [campaignId, cfg.source])
+  }, [campaignId])
 
   const filteredLeads = useMemo(
     () => (cfg.leadFilter ? leads.filter(cfg.leadFilter) : []),
     [leads, cfg],
   )
-  const filteredOpps = useMemo(
-    () => (cfg.oppFilter ? opps.filter(cfg.oppFilter) : []),
-    [opps, cfg],
-  )
 
-  const count = cfg.source === 'leads' ? filteredLeads.length : filteredOpps.length
+  const count = filteredLeads.length
 
   return (
     <div className="relative min-h-screen bg-neutral-950 text-neutral-100">
@@ -186,18 +131,12 @@ export default function BucketPage() {
             </div>
           )}
 
-          {cfg.source === 'leads' &&
-            filteredLeads.map((lead, i) => (
-              <LeadDetailCard
-                key={`${lead.source_post_url || lead.linkedin_url || lead.name}-${i}`}
-                lead={lead}
-              />
-            ))}
-
-          {cfg.source === 'opportunities' &&
-            filteredOpps.map((opp) => (
-              <OpportunityDetailCard key={opp.id} opp={opp} />
-            ))}
+          {filteredLeads.map((lead, i) => (
+            <LeadDetailCard
+              key={`${lead.source_post_url || lead.linkedin_url || lead.name}-${i}`}
+              lead={lead}
+            />
+          ))}
         </div>
       </div>
     </div>

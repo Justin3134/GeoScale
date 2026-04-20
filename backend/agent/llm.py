@@ -55,3 +55,32 @@ def think_json(system_prompt: str, user_message: str, max_tokens: int = 1000):
         return json.loads(raw)
     except Exception:
         return None
+
+
+def translate_keywords(keywords: list[str], language_name: str) -> list[str]:
+    """
+    Translate a list of English keyword phrases into `language_name`.
+
+    Returns the translated list. Falls back to the original list if the LLM
+    fails or returns something unparseable, so callers are always safe.
+    """
+    if not keywords:
+        return keywords
+    raw = think(
+        "You are a precise translator. Return ONLY a JSON array of strings — no prose, no markdown.",
+        (
+            f"Translate each keyword phrase below into {language_name}. "
+            f"Use natural expressions that a native speaker would actually type "
+            f"when searching for or discussing this topic — not word-for-word transliterations.\n\n"
+            f"Keywords: {json.dumps(keywords, ensure_ascii=False)}\n\n"
+            f"Return a JSON array of the same length, e.g. [\"번역1\", \"번역2\"]"
+        ),
+        max_tokens=400,
+    )
+    try:
+        result = json.loads(raw)
+        if isinstance(result, list) and len(result) == len(keywords):
+            return [str(k) for k in result]
+    except Exception:
+        pass
+    return keywords

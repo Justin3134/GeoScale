@@ -37,6 +37,32 @@ body {
   -webkit-mask-image: radial-gradient(ellipse 80% 60% at 50% 30%, black 30%, transparent 80%);
 }
 
+/* Terminal log line entrance */
+@keyframes logEntry {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-log-entry {
+  animation: logEntry 0.18s ease-out both;
+}
+
+/* Terminal cursor blink */
+@keyframes terminalBlink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+.terminal-cursor {
+  animation: terminalBlink 1s step-end infinite;
+}
+
 /* Slim scrollbars in dark mode */
 *::-webkit-scrollbar {
   width: 6px;

@@ -36,7 +36,7 @@ from agent.tools import _apify_run, _platform_from_site, scrape_native_social
 # ─── Per-actor input builders ──────────────────────────────────────────────
 
 
-def _blind_input(keyword: str, max_results: int) -> dict:
+def _blind_input(keyword: str, max_results: int, country_code: str = "kr") -> dict:
     """TeamBlind doesn't have keyword search via the actor's schema, so we
     feed it the public search URL plus the popular feed as a fallback.
     The actor follows /search/* and /?sort=pop list pages."""
@@ -52,12 +52,12 @@ def _blind_input(keyword: str, max_results: int) -> dict:
         "proxyConfiguration": {
             "useApifyProxy": True,
             "apifyProxyGroups": ["RESIDENTIAL"],
-            "apifyProxyCountry": "KR",
+            "apifyProxyCountry": country_code.upper(),
         },
     }
 
 
-def _naver_cafe_input(keyword: str, max_results: int) -> dict:
+def _naver_cafe_input(keyword: str, max_results: int, country_code: str = "kr") -> dict:
     """The actor crawls Naver search → cafe posts. Feed it the Naver search
     URL for cafe articles (`where=articleg`)."""
     keyword_q = quote_plus(keyword)
@@ -70,45 +70,71 @@ def _naver_cafe_input(keyword: str, max_results: int) -> dict:
             }
         ],
         "maxItems": max_results,
+        "proxyConfiguration": {
+            "useApifyProxy": True,
+            "apifyProxyGroups": ["RESIDENTIAL"],
+            "apifyProxyCountry": country_code.upper(),
+        },
     }
 
 
-def _naver_blog_cafe_input(keyword: str, max_results: int) -> dict:
+def _naver_blog_cafe_input(keyword: str, max_results: int, country_code: str = "kr") -> dict:
     """huggable_quote/naver-blog-cafe-scraper — keyword + URL search."""
     return {
         "keyword": keyword,
         "maxItems": max_results,
         "includeBlog": True,
         "includeCafe": True,
+        "proxyConfiguration": {
+            "useApifyProxy": True,
+            "apifyProxyGroups": ["RESIDENTIAL"],
+            "apifyProxyCountry": country_code.upper(),
+        },
     }
 
 
-def _naver_kin_input(keyword: str, max_results: int) -> dict:
+def _naver_kin_input(keyword: str, max_results: int, country_code: str = "kr") -> dict:
     return {
-        "keyword": keyword,
+        "query": keyword,
         "maxResults": max_results,
         "sort": "newest",
+        "proxyConfiguration": {
+            "useApifyProxy": True,
+            "apifyProxyGroups": ["RESIDENTIAL"],
+            "apifyProxyCountry": country_code.upper(),
+        },
     }
 
 
-def _weibo_input(keyword: str, max_results: int) -> dict:
+def _weibo_input(keyword: str, max_results: int, country_code: str = "cn") -> dict:
     """Weibo actor only takes `limit` — no keyword filter. We pull the main
     feed and filter post-hoc in `_weibo_norm` to keep posts containing
     the keyword."""
-    return {"limit": max_results * 4}
+    return {
+        "limit": max_results * 4,
+        "proxyConfiguration": {
+            "useApifyProxy": True,
+            "apifyProxyGroups": ["RESIDENTIAL"],
+            "apifyProxyCountry": country_code.upper(),
+        },
+    }
 
 
-def _xiaohongshu_input(keyword: str, max_results: int) -> dict:
+def _xiaohongshu_input(keyword: str, max_results: int, country_code: str = "cn") -> dict:
     return {
         "keywords": [keyword],
         "sortType": "general",
         "noteType": "all",
         "maxItems": max_results,
-        "proxyConfiguration": {"useApifyProxy": True},
+        "proxyConfiguration": {
+            "useApifyProxy": True,
+            "apifyProxyGroups": ["RESIDENTIAL"],
+            "apifyProxyCountry": country_code.upper(),
+        },
     }
 
 
-def _douyin_comments_input(keyword: str, max_results: int) -> dict:
+def _douyin_comments_input(keyword: str, max_results: int, country_code: str = "cn") -> dict:
     """Douyin comments scraper takes a video URL not a keyword. We can't
     derive a video URL from a pain keyword cleanly, so this entry stays
     here for future expansion. For now we fall back to Google site:."""
@@ -237,17 +263,11 @@ def _xiaohongshu_norm(item: dict, site: str) -> dict:
 # ─── Registry ─────────────────────────────────────────────────────────────
 
 
+# build_input signature: (keyword: str, max_results: int, country_code: str) -> dict
 PLATFORM_SCRAPERS: dict[str, dict[str, Any]] = {
-    "blind.com": {
-        "actor": "hypebridge/blind-post-scraper",
-        "build_input": _blind_input,
-        "normalize": _blind_norm,
-    },
-    "teamblind.com": {
-        "actor": "hypebridge/blind-post-scraper",
-        "build_input": _blind_input,
-        "normalize": _blind_norm,
-    },
+    # blind.com / teamblind.com: hypebridge/blind-post-scraper costs $25/1k —
+    # removed to avoid exhausting free-plan credits. Falls through to the
+    # Google `site:` shim in scrape_native_social() instead.
     "cafe.naver.com": {
         "actor": "naver_crawling/naver-search-cafe-crawling",
         "build_input": _naver_cafe_input,
@@ -287,6 +307,7 @@ def scrape_platform(
     locale: str,
     max_results: int = 10,
     campaign_id: str | None = None,
+    timeout_secs: int = 180,
 ) -> list[dict]:
     """
     Scrape one platform for posts matching `keyword`.
@@ -301,12 +322,12 @@ def scrape_platform(
         )
 
     actor: str = cfg["actor"]
-    build_input: Callable[[str, int], dict] = cfg["build_input"]
+    build_input: Callable[[str, int, str], dict] = cfg["build_input"]
     normalize: Callable[[dict, str], dict] = cfg["normalize"]
     post_filter: Callable[[list[dict], str], list[dict]] | None = cfg.get("post_filter")
 
     try:
-        run_input = build_input(keyword, max_results)
+        run_input = build_input(keyword, max_results, country_code)
     except NotImplementedError:
         # Actor exists but isn't keyword-addressable (e.g. Douyin needs a
         # video URL). Fall back to Google.
@@ -320,6 +341,7 @@ def scrape_platform(
         campaign_id=campaign_id,
         stream="people",
         max_items=max_results * 4,
+        timeout_secs=timeout_secs,
     )
 
     if post_filter is not None:

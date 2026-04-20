@@ -12,17 +12,25 @@ export function useAgentStream(campaignId: string | undefined) {
   useEffect(() => {
     if (!campaignId) return
     let cancelled = false
+    const timeout = setTimeout(() => {
+      if (!cancelled) setLoaded(true)
+    }, 8000)
     getActions(campaignId)
       .then((actions) => {
         if (cancelled) return
+        clearTimeout(timeout)
         setEvents(actions)
         setLoaded(true)
       })
       .catch(() => {
-        if (!cancelled) setLoaded(true)
+        if (!cancelled) {
+          clearTimeout(timeout)
+          setLoaded(true)
+        }
       })
     return () => {
       cancelled = true
+      clearTimeout(timeout)
     }
   }, [campaignId])
 

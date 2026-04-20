@@ -4,38 +4,34 @@ Country -> language / platforms / cultural-context map.
 Drives every country-aware behavior: which Apify scrapers to point where,
 what language Llama-3.3 should reply in, and what cultural notes the LLM
 should respect.
+
+Active platforms: LinkedIn, Reddit, Instagram, YouTube, Gmail/Google.
+Naver and TikTok have been removed.
 """
 
 COUNTRY_CONFIG: dict[str, dict] = {
     "South Korea": {
         "language": "ko",
         "language_name": "Korean",
+        "local_name": "한국",
         "search_locale": "ko",
         "search_country": "kr",
-        "social": ["linkedin", "reddit", "naver", "blind"],
+        "youtube_gl": "KR",
+        "youtube_hl": "ko",
+        "social": ["linkedin", "reddit", "youtube", "instagram"],
         "people_sites": [
-            "blind.com",
-            "cafe.naver.com",
-            "kin.naver.com",
-            "blog.naver.com",
-            "okky.kr",
+            # Korean-native platforms — scraped via Google site: with Korean keywords
+            "cafe.naver.com",        # Naver Café — largest Korean community forum
+            "blog.naver.com",        # Naver Blog — Korea's biggest blogging platform
+            "blind.com",             # Blind — anonymous Korean tech/startup pro network
+            "okky.kr",               # Korean developer community Q&A
+            "disquiet.io",           # Korean indie hacker / startup community
+            # Reddit Korea subs (English-language, expats & Korean bilingual users)
             "reddit.com/r/korea",
             "reddit.com/r/seoul",
-            "reddit.com/r/Living_in_Korea",
-        ],
-        "opportunity_queries": [
-            'hackathon Korea {industry} 2026',
-            'Seoul {industry} startup conference 2026',
-            '"call for speakers" Korea {industry}',
-            'Korea {industry} press contact email site:techm.kr OR site:bloter.net OR site:venturesquare.net',
-            'Korea {industry} accelerator program 2026',
-            '한국 {industry} 벤처캐피털 VC 투자 프로그램 2026',
-            'Korea {industry} VC fund startup investment 2026',
-            'Korea tech press journalist email {industry}',
         ],
         "signals": {
             "funding": [
-                "oxygenated_quagmire/naver-news-scraper",
                 "fortuitous_pirate/south-korea-dart-scraper",
             ],
             "hiring": ["curious_coder/linkedin-jobs-scraper"],
@@ -49,23 +45,15 @@ COUNTRY_CONFIG: dict[str, dict] = {
     "Japan": {
         "language": "ja",
         "language_name": "Japanese",
+        "local_name": "日本",
         "search_locale": "ja",
         "search_country": "jp",
-        "social": ["linkedin", "reddit", "x"],
+        "youtube_gl": "JP",
+        "youtube_hl": "ja",
+        "social": ["linkedin", "reddit", "youtube", "instagram"],
         "people_sites": [
-            "qiita.com",
-            "zenn.dev",
-            "note.com",
             "reddit.com/r/japanlife",
             "reddit.com/r/Tokyo",
-        ],
-        "opportunity_queries": [
-            'ハッカソン {industry} 2026',
-            'Japan {industry} startup conference 2026',
-            'Tokyo {industry} meetup 2026',
-            'Japan {industry} tech press contact email site:techcrunch.jp OR site:thebridge.jp',
-            'Japan {industry} accelerator program 2026',
-            'Japan {industry} VC fund startup investment 2026',
         ],
         "cultural_context": (
             "Extreme formality. Use です/ます form. Build trust via humility. "
@@ -75,24 +63,17 @@ COUNTRY_CONFIG: dict[str, dict] = {
     "India": {
         "language": "en",
         "language_name": "English",
+        "local_name": "India",
         "search_locale": "en",
         "search_country": "in",
-        "social": ["linkedin", "reddit", "youtube", "quora", "tiktok"],
+        "youtube_gl": "IN",
+        "youtube_hl": "en",
+        "social": ["linkedin", "reddit", "youtube", "instagram"],
         "people_sites": [
-            "quora.com",
             "reddit.com/r/india",
             "reddit.com/r/indianstartups",
             "reddit.com/r/developersIndia",
             "reddit.com/r/bangalore",
-            "tiktok.com",
-        ],
-        "opportunity_queries": [
-            'hackathon India {industry} 2026',
-            'Bangalore {industry} startup conference 2026',
-            '"call for speakers" India {industry}',
-            'India {industry} tech press contact email site:inc42.com OR site:yourstory.com',
-            'India {industry} accelerator program 2026',
-            'India {industry} VC fund startup investment 2026',
         ],
         "signals": {
             "funding": [
@@ -111,23 +92,17 @@ COUNTRY_CONFIG: dict[str, dict] = {
     "China": {
         "language": "zh",
         "language_name": "Simplified Chinese",
+        "local_name": "中国",
         "search_locale": "zh-CN",
         "search_country": "cn",
-        "social": ["weibo", "zhihu", "xiaohongshu"],
+        "youtube_gl": "CN",
+        "youtube_hl": "zh-CN",
+        "social": ["linkedin", "instagram", "youtube"],
         "people_sites": [
             "zhihu.com",
             "weibo.com",
-            "xiaohongshu.com",
-            "douyin.com",
             "v2ex.com",
             "juejin.cn",
-        ],
-        "opportunity_queries": [
-            '黑客松 {industry} 2026',
-            'China {industry} startup conference 2026',
-            'Shanghai {industry} meetup',
-            'China {industry} accelerator 2026',
-            'China {industry} VC fund startup investment 2026',
         ],
         "signals": {
             "funding": [
@@ -143,21 +118,16 @@ COUNTRY_CONFIG: dict[str, dict] = {
     "Germany": {
         "language": "de",
         "language_name": "German",
+        "local_name": "Deutschland",
         "search_locale": "de",
         "search_country": "de",
-        "social": ["linkedin", "reddit", "xing"],
+        "youtube_gl": "DE",
+        "youtube_hl": "de",
+        "social": ["linkedin", "reddit", "youtube", "instagram"],
         "people_sites": [
             "reddit.com/r/de",
             "reddit.com/r/berlin",
             "reddit.com/r/germany",
-            "xing.com",
-        ],
-        "opportunity_queries": [
-            'Hackathon Deutschland {industry} 2026',
-            'Berlin {industry} Konferenz 2026',
-            'Germany {industry} tech press contact email site:gruenderszene.de OR site:deutsche-startups.de',
-            'Germany {industry} Accelerator 2026',
-            'Germany {industry} VC Fonds Startup Investition 2026',
         ],
         "cultural_context": (
             "Direct, fact-based, no fluff. Privacy-conscious — be transparent about why "
@@ -168,21 +138,15 @@ COUNTRY_CONFIG: dict[str, dict] = {
     "Singapore": {
         "language": "en",
         "language_name": "English",
+        "local_name": "Singapore",
         "search_locale": "en",
         "search_country": "sg",
-        "social": ["linkedin", "reddit", "youtube"],
+        "youtube_gl": "SG",
+        "youtube_hl": "en",
+        "social": ["linkedin", "reddit", "youtube", "instagram"],
         "people_sites": [
             "reddit.com/r/singapore",
             "reddit.com/r/singaporefi",
-            "hardwarezone.com.sg",
-        ],
-        "opportunity_queries": [
-            'hackathon Singapore {industry} 2026',
-            'Singapore {industry} startup conference 2026',
-            '"call for speakers" Singapore {industry}',
-            'Singapore {industry} tech press contact email site:techinasia.com OR site:e27.co',
-            'Singapore {industry} accelerator program 2026',
-            'Singapore {industry} VC fund startup investment 2026',
         ],
         "cultural_context": (
             "Professional, polished, multicultural. English standard. "
@@ -192,24 +156,16 @@ COUNTRY_CONFIG: dict[str, dict] = {
     "United States": {
         "language": "en",
         "language_name": "English",
+        "local_name": "USA",
         "search_locale": "en",
         "search_country": "us",
-        "social": ["linkedin", "reddit", "youtube", "tiktok"],
+        "youtube_gl": "US",
+        "youtube_hl": "en",
+        "social": ["linkedin", "reddit", "youtube", "instagram"],
         "people_sites": [
             "reddit.com/r/startups",
             "reddit.com/r/SaaS",
             "reddit.com/r/Entrepreneur",
-            "news.ycombinator.com",
-            "indiehackers.com",
-            "tiktok.com",
-        ],
-        "opportunity_queries": [
-            'hackathon USA {industry} 2026',
-            '{industry} startup conference USA 2026',
-            '"call for speakers" {industry} USA',
-            '{industry} tech press contact email site:techcrunch.com OR site:venturebeat.com',
-            '{industry} accelerator program USA 2026',
-            '{industry} VC fund startup investment USA 2026',
         ],
         "cultural_context": (
             "Direct, ROI-first. Casual but professional. Lead with numbers and outcomes. "
@@ -219,20 +175,15 @@ COUNTRY_CONFIG: dict[str, dict] = {
     "Brazil": {
         "language": "pt",
         "language_name": "Brazilian Portuguese",
+        "local_name": "Brasil",
         "search_locale": "pt-BR",
         "search_country": "br",
-        "social": ["linkedin", "reddit", "youtube", "tiktok"],
+        "youtube_gl": "BR",
+        "youtube_hl": "pt",
+        "social": ["linkedin", "reddit", "youtube", "instagram"],
         "people_sites": [
             "reddit.com/r/brasil",
             "reddit.com/r/brdev",
-            "tabnews.com.br",
-            "tiktok.com",
-        ],
-        "opportunity_queries": [
-            'hackathon Brasil {industry} 2026',
-            'São Paulo {industry} conferência 2026',
-            'Brazil {industry} accelerator 2026',
-            'Brazil {industry} VC fund startup investimento 2026',
         ],
         "cultural_context": (
             "Warm, personal tone. Use tu/você naturally. Brazilians appreciate humor "
@@ -251,14 +202,10 @@ def get_country_config(country: str) -> dict:
         "language_name": "English",
         "search_locale": "en",
         "search_country": "us",
-        "social": ["linkedin", "reddit", "youtube"],
-        "people_sites": ["reddit.com/r/startups", "reddit.com/r/SaaS"],
-        "opportunity_queries": [
-            "hackathon {country} {industry} 2026",
-            "{country} {industry} conference 2026",
-            "{country} {industry} accelerator 2026",
-            "{country} {industry} tech press contact email",
-            "{country} {industry} VC fund startup investment 2026",
+        "social": ["linkedin", "reddit", "youtube", "instagram"],
+        "people_sites": [
+            "reddit.com/r/startups",
+            "reddit.com/r/SaaS",
         ],
         "cultural_context": "Be professional, respectful, and lead with empathy.",
     }

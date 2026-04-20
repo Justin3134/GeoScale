@@ -1,32 +1,31 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { approveAction, rejectAction } from '@/lib/api'
+import { useEffect, useMemo, useRef } from 'react'
 import type { AgentEvent, AgentEventType, StreamId } from '@/lib/types'
 
-const TYPE_DOT: Record<AgentEventType, string> = {
-  scan: 'bg-sky-400',
-  think: 'bg-violet-400',
-  act: 'bg-emerald-400',
-  preview: 'bg-fuchsia-400 animate-pulse',
-  wait: 'bg-amber-400',
-  escalate: 'bg-rose-400',
-  error: 'bg-rose-500',
+const TYPE_CFG: Record<AgentEventType, { color: string; symbol: string }> = {
+  scan:    { color: 'text-sky-400',     symbol: '›' },
+  think:   { color: 'text-violet-400',  symbol: '·' },
+  act:     { color: 'text-emerald-400', symbol: '▶' },
+  preview: { color: 'text-fuchsia-400', symbol: '◎' },
+  wait:    { color: 'text-amber-400',   symbol: '⏸' },
+  escalate:{ color: 'text-rose-400',    symbol: '⚑' },
+  error:   { color: 'text-rose-500',    symbol: '✗' },
 }
 
 const CHANNEL_LABEL: Record<string, string> = {
-  apify: 'apify',
-  llm: 'do·llama',
-  'browser-use': 'browser-use',
-  linkedin: 'linkedin',
-  reddit: 'reddit',
-  youtube: 'youtube',
-  tiktok: 'tiktok',
-  naver: 'naver',
-  quora: 'quora',
-  zhihu: 'zhihu',
-  weibo: 'weibo',
-  blind: 'blind',
+  apify:        'apify',
+  llm:          'llm',
+  'browser-use':'b-use',
+  linkedin:     'li',
+  reddit:       'rd',
+  youtube:      'yt',
+  tiktok:       'tk',
+  naver:        'nvr',
+  quora:        'qr',
+  zhihu:        'zh',
+  weibo:        'wb',
+  blind:        'bld',
 }
 
 function formatTime(time?: string): string {
@@ -41,67 +40,6 @@ function formatTime(time?: string): string {
   })
 }
 
-type ApprovalState = 'pending' | 'approved' | 'rejected' | 'expired'
-
-interface ApprovalButtonsProps {
-  campaignId: string
-  approvalId: string
-  onResolved: (approvalId: string, decision: 'approved' | 'rejected') => void
-}
-
-function ApprovalButtons({ campaignId, approvalId, onResolved }: ApprovalButtonsProps) {
-  const [busy, setBusy] = useState<'approve' | 'reject' | null>(null)
-
-  const handle = useCallback(
-    async (action: 'approve' | 'reject') => {
-      setBusy(action)
-      try {
-        if (action === 'approve') {
-          await approveAction(campaignId, approvalId)
-          onResolved(approvalId, 'approved')
-        } else {
-          await rejectAction(campaignId, approvalId)
-          onResolved(approvalId, 'rejected')
-        }
-      } catch {
-        // If 404, the approval expired — still mark locally
-        onResolved(approvalId, action === 'approve' ? 'approved' : 'rejected')
-      } finally {
-        setBusy(null)
-      }
-    },
-    [campaignId, approvalId, onResolved],
-  )
-
-  return (
-    <div className="flex items-center gap-2 mt-2">
-      <button
-        onClick={() => handle('approve')}
-        disabled={busy !== null}
-        className="flex items-center gap-1.5 px-3 py-1 rounded-md text-[11px] font-mono font-medium bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/25 hover:border-emerald-400/60 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-      >
-        {busy === 'approve' ? (
-          <span className="animate-spin inline-block w-2.5 h-2.5 border border-emerald-400 border-t-transparent rounded-full" />
-        ) : (
-          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-        )}
-        Run it
-      </button>
-      <button
-        onClick={() => handle('reject')}
-        disabled={busy !== null}
-        className="flex items-center gap-1.5 px-3 py-1 rounded-md text-[11px] font-mono font-medium bg-neutral-800/60 border border-neutral-700 text-neutral-400 hover:bg-neutral-700/60 hover:text-neutral-300 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-      >
-        {busy === 'reject' ? (
-          <span className="animate-spin inline-block w-2.5 h-2.5 border border-neutral-500 border-t-transparent rounded-full" />
-        ) : (
-          <span className="w-1.5 h-1.5 rounded-full bg-neutral-500" />
-        )}
-        Skip
-      </button>
-    </div>
-  )
-}
 
 interface Props {
   campaignId?: string
@@ -110,32 +48,35 @@ interface Props {
   loaded?: boolean
   emptyLabel?: string
   cap?: number
+  /** When set, only show events for this platform channel (or action text mentioning it). */
+  platform?: string
 }
 
 export default function PanelActivityFeed({
-  campaignId,
+  campaignId: _campaignId,
   events,
   streams,
   loaded = true,
   emptyLabel = '› awaiting first action…',
   cap = 60,
+  platform,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null)
 
-  // Track decisions made this session so buttons disappear after clicking
-  const [resolved, setResolved] = useState<Record<string, ApprovalState>>({})
-
-  const handleResolved = useCallback(
-    (approvalId: string, decision: 'approved' | 'rejected') => {
-      setResolved((prev) => ({ ...prev, [approvalId]: decision }))
-    },
-    [],
-  )
-
-  const filtered = useMemo(() => {
+  const allInStreams = useMemo(() => {
     const allow = new Set(streams)
     return events.filter((ev) => allow.has((ev.stream || 'system') as StreamId))
   }, [events, streams])
+
+  const filtered = useMemo(() => {
+    if (!platform || platform === 'all') return allInStreams
+    const p = platform.toLowerCase()
+    return allInStreams.filter(
+      (ev) =>
+        (ev.channel || '').toLowerCase() === p ||
+        (ev.action || '').toLowerCase().includes(p),
+    )
+  }, [allInStreams, platform])
 
   useEffect(() => {
     const el = containerRef.current
@@ -143,147 +84,128 @@ export default function PanelActivityFeed({
   }, [filtered.length])
 
   const visible = filtered.slice(-cap)
-
-  if (!loaded) {
-    return (
-      <p className="text-sm text-neutral-500 font-mono px-1">› loading…</p>
-    )
-  }
-
-  if (visible.length === 0) {
-    return (
-      <p className="text-sm text-neutral-500 font-mono px-1">{emptyLabel}</p>
-    )
-  }
+  const isLive = loaded && visible.length > 0
 
   return (
-    <div
-      ref={containerRef}
-      className="flex flex-col gap-1.5 overflow-y-auto pr-1 flex-1 min-h-0"
-    >
-      {visible.map((ev, i) => {
-        const dot = TYPE_DOT[ev.type] || 'bg-neutral-500'
-        const channel = ev.channel
-          ? CHANNEL_LABEL[ev.channel] || ev.channel
-          : ''
-        const approvalId = ev.preview?.approval_id ?? null
-        const approvalState = approvalId ? (resolved[approvalId] ?? 'pending') : null
-        const isAwaitingApproval = approvalState === 'pending' && !!campaignId && !!approvalId
+    <div className="flex flex-col min-h-0 flex-1 rounded-lg border border-neutral-800/60 bg-[#080a0a] overflow-hidden">
 
-        return (
-          <div
-            key={`${ev.time || 'evt'}-${i}`}
-            className={`rounded-md border px-2.5 py-1.5 ${
-              ev.type === 'preview'
-                ? 'border-fuchsia-900/50 bg-fuchsia-950/15'
-                : 'border-neutral-800 bg-neutral-950/60'
-            }`}
-          >
-            <div className="flex items-center gap-1.5 mb-0.5">
-              <span className={`w-1.5 h-1.5 rounded-full ${dot}`} aria-hidden />
-              <span className="text-[9px] font-mono uppercase tracking-wider text-neutral-600">
-                {formatTime(ev.time)}
-              </span>
-              {channel && (
-                <span className="text-[9px] font-mono uppercase tracking-wider text-neutral-500">
-                  {channel}
+      {/* Log area */}
+      <div
+        ref={containerRef}
+        className="flex-1 min-h-0 overflow-y-auto px-3 py-2.5 font-mono text-[11px]"
+      >
+        {!loaded && (
+          <div className="flex gap-1.5 text-neutral-600 leading-relaxed">
+            <span className="w-[5.5rem] shrink-0 text-right tabular-nums select-none">--:--:--</span>
+            <span className="text-neutral-700 select-none">›</span>
+            <span className="animate-pulse text-neutral-500">loading…</span>
+          </div>
+        )}
+
+        {loaded && visible.length === 0 && (
+          <div className="flex gap-1.5 text-neutral-600 leading-relaxed">
+            <span className="w-[5.5rem] shrink-0 text-right tabular-nums select-none">--:--:--</span>
+            <span className="text-neutral-700 select-none">›</span>
+            <span>
+              {platform && platform !== 'all' && allInStreams.length > 0
+                ? `no ${platform} activity yet — agent is running on other channels`
+                : emptyLabel.replace(/^[›>]\s*/, '')}
+            </span>
+          </div>
+        )}
+
+        {loaded && visible.map((ev, i) => {
+          const cfg = TYPE_CFG[ev.type] ?? TYPE_CFG.scan
+          const channel = ev.channel ? (CHANNEL_LABEL[ev.channel] || ev.channel) : ''
+
+          return (
+            <div key={`${ev.time || 'evt'}-${i}`} className="animate-log-entry mb-2">
+              {/* Main log line */}
+              <div className="flex gap-1.5 items-baseline leading-relaxed">
+                <span className="text-neutral-700 w-[5.5rem] shrink-0 text-right tabular-nums select-none">
+                  {formatTime(ev.time)}
                 </span>
-              )}
-              <span className="text-[9px] font-mono uppercase tracking-wider text-neutral-600">
-                {ev.type}
-              </span>
-              {ev.type === 'preview' && approvalState && (
-                <span
-                  className={`ml-auto text-[9px] font-mono uppercase tracking-wider shrink-0 ${
-                    approvalState === 'approved'
-                      ? 'text-emerald-400'
-                      : approvalState === 'rejected'
-                        ? 'text-neutral-500'
-                        : approvalState === 'expired'
-                          ? 'text-amber-500'
-                          : 'text-fuchsia-400 animate-pulse'
-                  }`}
-                >
-                  {approvalState === 'approved'
-                    ? '✓ approved'
-                    : approvalState === 'rejected'
-                      ? '✗ skipped'
-                      : approvalState === 'expired'
-                        ? 'expired'
-                        : '⏳ awaiting'}
+                <span className={`${cfg.color} shrink-0 select-none w-3 text-center`}>
+                  {cfg.symbol}
                 </span>
-              )}
-              {ev.live_url && (
-                <a
-                  href={ev.live_url}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="ml-auto text-[10px] font-mono text-emerald-400 hover:text-emerald-300 shrink-0"
-                >
-                  ↗ live
-                </a>
-              )}
-            </div>
-
-            <p className="text-[12px] text-neutral-200 leading-snug">
-              {ev.action}
-            </p>
-            {ev.reasoning && (
-              <p className="text-[11px] text-neutral-500 leading-snug mt-0.5 line-clamp-2">
-                {ev.reasoning}
-              </p>
-            )}
-
-            {/* Preview body — show drafted message */}
-            {ev.type === 'preview' && ev.preview?.body_local && (
-              <div className="mt-2 rounded border border-fuchsia-900/40 bg-fuchsia-950/20 px-2 py-1.5">
-                {ev.preview.subject && (
-                  <p className="text-[10px] font-mono uppercase tracking-wider text-fuchsia-400 mb-1">
-                    subj: {ev.preview.subject}
-                  </p>
+                {channel && (
+                  <span className="text-neutral-600 shrink-0 uppercase text-[9px] tracking-widest leading-[1.6]">
+                    {channel}
+                  </span>
                 )}
-                <p className="text-[12px] text-fuchsia-100 leading-snug whitespace-pre-wrap break-words">
-                  {ev.preview.body_local}
-                </p>
-                {ev.preview.english_gloss && (
-                  <p className="mt-1 text-[10.5px] text-neutral-500 italic leading-snug">
-                    ↳ {ev.preview.english_gloss}
-                  </p>
-                )}
-                {ev.preview.target_url && (
+                <span className="text-neutral-200 break-words flex-1 leading-relaxed">
+                  {ev.action}
+                </span>
+                {ev.live_url && (
                   <a
-                    href={ev.preview.target_url}
+                    href={ev.live_url}
                     target="_blank"
                     rel="noreferrer"
-                    className="mt-1 inline-block text-[10px] font-mono text-fuchsia-400 hover:text-fuchsia-300 truncate max-w-full"
+                    className="ml-1 text-emerald-400 hover:text-emerald-300 shrink-0"
                   >
-                    ↗ {ev.preview.target_url}
+                    ↗
                   </a>
                 )}
-
-                {/* Approval buttons — only when waiting for human decision */}
-                {isAwaitingApproval && (
-                  <ApprovalButtons
-                    campaignId={campaignId!}
-                    approvalId={approvalId!}
-                    onResolved={handleResolved}
-                  />
-                )}
-                {approvalState === 'approved' && !isAwaitingApproval && (
-                  <p className="mt-2 text-[10px] font-mono text-emerald-400">
-                    ✓ Approved — browser-use running
-                  </p>
-                )}
-                {approvalState === 'rejected' && !isAwaitingApproval && (
-                  <p className="mt-2 text-[10px] font-mono text-neutral-500">
-                    ✗ Skipped by you
-                  </p>
-                )}
               </div>
-            )}
+
+              {/* Reasoning (indented, dimmer) */}
+              {ev.reasoning && (
+                <div className="flex gap-1.5 items-baseline mt-0.5">
+                  <span className="w-[5.5rem] shrink-0 select-none" />
+                  <span className="w-3 shrink-0 select-none" />
+                  {channel && (
+                    <span className="text-[9px] uppercase tracking-widest opacity-0 select-none shrink-0">
+                      {channel}
+                    </span>
+                  )}
+                  <span className="text-neutral-600 break-words flex-1 text-[10.5px] leading-snug line-clamp-2">
+                    {ev.reasoning}
+                  </span>
+                </div>
+              )}
+
+              {/* Approval type: preview with message body */}
+              {ev.type === 'preview' && ev.preview?.body_local && (
+                <div className="mt-1.5 ml-[6.5rem] rounded border border-fuchsia-900/30 bg-fuchsia-950/15 px-2 py-1.5">
+                  {ev.preview.subject && (
+                    <p className="text-[9px] text-fuchsia-400/80 uppercase tracking-widest mb-1">
+                      subj: {ev.preview.subject}
+                    </p>
+                  )}
+                  <p className="text-[11px] text-fuchsia-100/90 whitespace-pre-wrap break-words leading-snug">
+                    {ev.preview.body_local}
+                  </p>
+                  {ev.preview.english_gloss && (
+                    <p className="mt-1 text-[10px] text-neutral-500 italic">
+                      ↳ {ev.preview.english_gloss}
+                    </p>
+                  )}
+                  {ev.preview.target_url && (
+                    <a
+                      href={ev.preview.target_url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="mt-1 inline-block text-[10px] text-fuchsia-400 hover:text-fuchsia-300 truncate max-w-full"
+                    >
+                      ↗ {ev.preview.target_url}
+                    </a>
+                  )}
+                </div>
+              )}
+            </div>
+          )
+        })}
+
+        {/* Blinking cursor */}
+        {loaded && (
+          <div className="flex gap-1.5 items-center mt-0.5 h-4">
+            <span className="w-[5.5rem] shrink-0 select-none" />
+            <span className="text-emerald-400/70 terminal-cursor text-[13px] leading-none select-none">
+              ▋
+            </span>
           </div>
-        )
-      })}
+        )}
+      </div>
     </div>
   )
 }

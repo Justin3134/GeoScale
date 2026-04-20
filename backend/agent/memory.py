@@ -5,7 +5,6 @@ from models.db import (
     ChannelStat,
     CompanySignal,
     Lead,
-    Opportunity,
     SessionLocal,
 )
 
@@ -75,14 +74,33 @@ def save_leads(campaign_id: str, leads: list[dict]) -> None:
         db.close()
 
 
-def save_opportunities(campaign_id: str, opps: list[dict]) -> None:
-    if not opps:
-        return
+def store_lead_draft(
+    campaign_id: str,
+    source_post_url: str | None,
+    name: str | None,
+    draft_text: str,
+    draft_language: str | None = None,
+) -> None:
+    """Store a drafted outreach message on a lead before it is actually sent.
+
+    Matches by source_post_url first, then falls back to name. Does NOT
+    overwrite reply_text if the lead has already been contacted.
+    """
     db = SessionLocal()
     try:
-        for opp in opps:
-            db.add(Opportunity(campaign_id=campaign_id, **opp))
-        db.commit()
+        q = db.query(Lead).filter(Lead.campaign_id == campaign_id)
+        if source_post_url:
+            q = q.filter(Lead.source_post_url == source_post_url)
+        elif name:
+            q = q.filter(Lead.name == name)
+        else:
+            return
+        lead = q.first()
+        if lead and lead.status == "identified":
+            lead.reply_text = draft_text
+            if draft_language:
+                lead.reply_language = draft_language
+            db.commit()
     finally:
         db.close()
 
@@ -104,34 +122,6 @@ def update_lead_status(
             lead.status = status
             if reply_text is not None:
                 lead.reply_text = reply_text
-            db.commit()
-    finally:
-        db.close()
-
-
-def update_opportunity_status(
-    campaign_id: str,
-    url: str,
-    status: str,
-    pitch_text: str | None = None,
-    contact_url: str | None = None,
-    contact_email: str | None = None,
-) -> None:
-    db = SessionLocal()
-    try:
-        opp = (
-            db.query(Opportunity)
-            .filter(Opportunity.campaign_id == campaign_id, Opportunity.url == url)
-            .first()
-        )
-        if opp:
-            opp.status = status
-            if pitch_text is not None:
-                opp.pitch_text = pitch_text
-            if contact_url is not None:
-                opp.contact_url = contact_url
-            if contact_email is not None:
-                opp.contact_email = contact_email
             db.commit()
     finally:
         db.close()

@@ -27,7 +27,7 @@ class Campaign(Base):
     language = Column(String, default="en")
     status = Column(String, default="running")  # running | paused | meeting_booked
     strategy_json = Column(Text, nullable=True)  # retained for schema compatibility
-    require_human_approval = Column(Integer, default=0)  # 0=auto, 1=require human approval
+    require_human_approval = Column(Integer, default=1)  # 0=auto, 1=require human approval
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -82,6 +82,7 @@ class Opportunity(Base):
     status = Column(String, default="identified")  # identified | contacted | replied | booked
     pitch_text = Column(Text, nullable=True)
     pitch_language = Column(String, nullable=True)
+    analysis = Column(Text, nullable=True)  # AI explanation of why this opportunity fits
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -132,4 +133,5 @@ def _ensure_column(table: str, column: str, ddl_type: str) -> None:
 _ensure_column("agent_actions", "live_url", "TEXT")
 _ensure_column("agent_actions", "session_ended", "INTEGER DEFAULT 0")
 _ensure_column("campaigns", "strategy_json", "TEXT")
-_ensure_column("campaigns", "require_human_approval", "INTEGER DEFAULT 0")
+_ensure_column("campaigns", "require_human_approval", "INTEGER DEFAULT 1")
+_ensure_column("opportunities", "analysis", "TEXT")

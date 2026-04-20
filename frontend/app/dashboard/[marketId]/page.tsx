@@ -4,20 +4,37 @@ import { useEffect, useState } from 'react'
 import { useParams } from 'next/navigation'
 import Link from 'next/link'
 import BrowserScreen from '@/components/BrowserScreen'
-import OpportunitiesStream from '@/components/OpportunitiesStream'
-import PeopleStream from '@/components/PeopleStream'
-import StatCardLink from '@/components/StatCardLink'
-import { getCampaign, getStats, pauseCampaign, updateCampaignSettings } from '@/lib/api'
-import type { Campaign, Stats } from '@/lib/types'
+import OutreachPanel from '@/components/OutreachPanel'
+import PanelActivityFeed from '@/components/PanelActivityFeed'
+import { getCampaign, getLeads, pauseCampaign, updateCampaignSettings } from '@/lib/api'
+import { useAgentStream } from '@/lib/useAgentStream'
+import type { Campaign, Lead } from '@/lib/types'
+
+const faviconUrl = (domain: string) =>
+  `https://www.google.com/s2/favicons?domain=${domain}&sz=32`
+
+const PLATFORM_TABS = [
+  { id: 'all',       label: 'All',       domain: null },
+  { id: 'linkedin',  label: 'LinkedIn',  domain: 'linkedin.com' },
+  { id: 'reddit',    label: 'Reddit',    domain: 'reddit.com' },
+  { id: 'instagram', label: 'Instagram', domain: 'instagram.com' },
+  { id: 'youtube',   label: 'YouTube',   domain: 'youtube.com' },
+  { id: 'gmail',     label: 'Gmail',     domain: 'gmail.com' },
+] as const
+
+type PlatformId = (typeof PLATFORM_TABS)[number]['id']
 
 export default function DashboardPage() {
   const params = useParams<{ marketId: string }>()
   const campaignId = params?.marketId as string
 
-  const [stats, setStats] = useState<Stats | null>(null)
   const [campaign, setCampaign] = useState<Campaign | null>(null)
+  const [leads, setLeads] = useState<Lead[]>([])
+  const [activePlatform, setActivePlatform] = useState<PlatformId>('all')
   const [busyPause, setBusyPause] = useState(false)
   const [busyApprovalToggle, setBusyApprovalToggle] = useState(false)
+  const [approvalError, setApprovalError] = useState<string | null>(null)
+  const { events, loaded } = useAgentStream(campaignId)
 
   useEffect(() => {
     if (!campaignId) return
@@ -25,13 +42,13 @@ export default function DashboardPage() {
 
     const load = async () => {
       try {
-        const [s, c] = await Promise.all([
-          getStats(campaignId),
+        const [c, l] = await Promise.all([
           getCampaign(campaignId),
+          getLeads(campaignId),
         ])
         if (cancelled) return
-        setStats(s)
         setCampaign(c)
+        setLeads(l)
       } catch {
         // ignore
       }
@@ -45,6 +62,33 @@ export default function DashboardPage() {
     }
   }, [campaignId])
 
+  // Immediately refresh leads when the backend signals new leads were saved.
+  // This fires well before the next 10-second poll so the UI stays in sync.
+  useEffect(() => {
+    if (!campaignId || events.length === 0) return
+    const latest = events[events.length - 1]
+    if (latest?.type === 'leads_updated') {
+      getLeads(campaignId)
+        .then((l) => setLeads(l))
+        .catch(() => {/* ignore */})
+    }
+  }, [campaignId, events])
+
+  const handleToggleApproval = async () => {
+    if (!campaign) return
+    setBusyApprovalToggle(true)
+    setApprovalError(null)
+    const next = !campaign.require_human_approval
+    try {
+      await updateCampaignSettings(campaignId, { require_human_approval: next })
+      setCampaign((c) => (c ? { ...c, require_human_approval: next } : c))
+    } catch (err) {
+      setApprovalError(err instanceof Error ? err.message : 'Failed to update settings')
+    } finally {
+      setBusyApprovalToggle(false)
+    }
+  }
+
   const handlePause = async () => {
     if (!campaign || campaign.status !== 'running') return
     setBusyPause(true)
@@ -53,18 +97,6 @@ export default function DashboardPage() {
       setCampaign((c) => (c ? { ...c, status: 'paused' } : c))
     } finally {
       setBusyPause(false)
-    }
-  }
-
-  const handleToggleApproval = async () => {
-    if (!campaign) return
-    setBusyApprovalToggle(true)
-    const next = !campaign.require_human_approval
-    try {
-      await updateCampaignSettings(campaignId, { require_human_approval: next })
-      setCampaign((c) => (c ? { ...c, require_human_approval: next } : c))
-    } finally {
-      setBusyApprovalToggle(false)
     }
   }
 
@@ -128,14 +160,19 @@ export default function DashboardPage() {
             )}
           </div>
           <div className="flex flex-col items-end gap-2">
-            {/* Human validation toggle */}
+            {approvalError && (
+              <span className="text-[10px] text-red-400 font-mono max-w-[18rem] text-right">
+                {approvalError}
+              </span>
+            )}
+            {/* Human verification toggle */}
             <button
               onClick={handleToggleApproval}
               disabled={busyApprovalToggle || !campaign}
               title={
                 campaign?.require_human_approval
-                  ? 'Human validation ON — click to run automatically'
-                  : 'Human validation OFF — click to require approval before each action'
+                  ? 'Human verification ON — click to auto-run everything'
+                  : 'Auto-run everything — click to require human verification'
               }
               className={`flex items-center gap-2 text-xs border rounded-lg px-3 py-1.5 transition-colors backdrop-blur-sm disabled:opacity-40 disabled:cursor-not-allowed ${
                 campaign?.require_human_approval
@@ -152,7 +189,7 @@ export default function DashboardPage() {
               )}
               <span className="font-mono uppercase tracking-[0.12em] text-[10px]">
                 {campaign?.require_human_approval
-                  ? 'Human validation ON'
+                  ? 'Human verification ON'
                   : 'Auto-run everything'}
               </span>
             </button>
@@ -168,41 +205,99 @@ export default function DashboardPage() {
           </div>
         </div>
 
-        {/* Stat cards */}
-        {stats && (
-          <div className="grid grid-cols-2 md:grid-cols-6 gap-3">
-            {[
-              { slug: 'people', label: 'People found', value: stats.total_leads },
-              { slug: 'contacted', label: 'People contacted', value: stats.contacted },
-              { slug: 'replied', label: 'Replied', value: stats.replied },
-              { slug: 'opportunities', label: 'Opportunities', value: stats.total_opportunities },
-              { slug: 'pitches', label: 'Pitches sent', value: stats.opportunities_contacted },
-              { slug: 'meetings', label: 'Meetings', value: stats.meetings },
-            ].map((card) => (
-              <StatCardLink
-                key={card.slug}
-                href={`/dashboard/${campaignId}/${card.slug}`}
-                label={card.label}
-                value={card.value}
-              />
-            ))}
-          </div>
-        )}
 
-        {/* Two-stream main panel */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 lg:h-[34rem]">
+        {/* ── Platform nav ─────────────────────────────────── */}
+        <div className="flex items-center gap-1.5 overflow-x-auto scrollbar-none pb-1">
+          {PLATFORM_TABS.map(tab => {
+            const count =
+              tab.id === 'all'   ? leads.length :
+              tab.id === 'gmail' ? leads.filter(l => (l.platform || '').toLowerCase() === 'gmail' || !!l.email).length :
+              leads.filter(l => (l.platform || 'linkedin').toLowerCase() === tab.id).length
+            const isActive = activePlatform === tab.id
+            return (
+              <button
+                key={tab.id}
+                onClick={() => setActivePlatform(tab.id)}
+                className={`inline-flex items-center gap-1.5 text-[12px] font-mono px-3 py-1.5 rounded-lg border shrink-0 transition-colors ${
+                  isActive
+                    ? 'bg-neutral-800 border-neutral-600 text-neutral-100'
+                    : 'bg-neutral-900/50 border-neutral-800 text-neutral-500 hover:text-neutral-300 hover:border-neutral-700'
+                }`}
+              >
+                {tab.domain ? (
+                  <img
+                    src={faviconUrl(tab.domain)}
+                    alt={tab.label}
+                    width={14}
+                    height={14}
+                    className="rounded-sm shrink-0"
+                  />
+                ) : (
+                  <span className="w-3.5 h-3.5 flex items-center justify-center text-[10px]">⊞</span>
+                )}
+                {tab.label}
+                <span className={`text-[11px] tabular-nums ml-0.5 ${isActive ? 'text-neutral-400' : 'text-neutral-700'}`}>
+                  {count}
+                </span>
+              </button>
+            )
+          })}
+        </div>
+
+        {/* ── Main panel — agent log left, outreach right ── */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 lg:h-[36rem]">
+          {/* Left: agent activity log */}
           <div className="bg-neutral-900/60 border border-neutral-800 rounded-xl p-5 backdrop-blur-sm flex flex-col h-[32rem] lg:h-full overflow-hidden">
-            <PeopleStream campaignId={campaignId} />
+            <div className="flex items-start justify-between mb-3 gap-3">
+              <div className="min-w-0">
+                <h2 className="text-[15px] font-medium text-neutral-100">Agent log</h2>
+                <p className="text-xs text-neutral-500 mt-0.5">
+                  {activePlatform === 'all'
+                    ? 'All streams — scans, scoring & outreach'
+                    : `${PLATFORM_TABS.find(t => t.id === activePlatform)?.label ?? activePlatform} — scraping, scoring & outreach`}
+                </p>
+              </div>
+              <span
+                className={`inline-flex items-center gap-1.5 text-[11px] border rounded-full px-2 py-0.5 shrink-0 transition-colors duration-500 ${
+                  !loaded
+                    ? 'text-amber-300/80 border-amber-900/50 bg-amber-950/20'
+                    : 'text-neutral-300 border-neutral-800 bg-neutral-900/60'
+                }`}
+              >
+                <span
+                  className={`h-1.5 w-1.5 rounded-full ${
+                    !loaded ? 'bg-amber-400 animate-pulse' : 'bg-emerald-400 animate-pulse'
+                  }`}
+                />
+                {!loaded ? 'loading…' : 'live'}
+              </span>
+            </div>
+            <PanelActivityFeed
+              campaignId={campaignId}
+              events={events}
+              streams={['people', 'signals', 'system']}
+              loaded={loaded}
+              emptyLabel="› agent is warming up…"
+              cap={120}
+              platform={activePlatform}
+            />
           </div>
+
+          {/* Right: outreach channels */}
           <div className="bg-neutral-900/60 border border-neutral-800 rounded-xl p-5 backdrop-blur-sm flex flex-col h-[32rem] lg:h-full overflow-hidden">
-            <OpportunitiesStream campaignId={campaignId} />
+            <OutreachPanel
+              campaignId={campaignId}
+              leads={leads}
+              activePlatform={activePlatform}
+              events={events}
+              loaded={loaded}
+            />
           </div>
         </div>
 
-        {/* Live browser viewers — one per stream */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+        {/* Live browser viewer */}
+        <div className="grid grid-cols-1 gap-3">
           <BrowserScreen campaignId={campaignId} stream="people" compact />
-          <BrowserScreen campaignId={campaignId} stream="opportunities" compact />
         </div>
       </div>
     </div>
